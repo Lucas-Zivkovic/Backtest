@@ -13,19 +13,20 @@ class CrossSectionalMomentumStrategy(MomentumStrategy):
     def select(self, prices: DataFrame) -> tuple[DataFrame, DataFrame]:
         """Raw momentum values of the tickers picked long/short on each date."""
         assert len(prices.columns) > 10
-        result = self.signal(prices).dropna()
+        result = self.score(prices).dropna()
         n = max(1, int(len(result.columns) * self.percentage))
         long = result.T.apply(lambda row: row.nlargest(n)).T
         short = result.T.apply(lambda row: row.nsmallest(n)).T
         return long, short
 
     def positions(self, prices: DataFrame) -> DataFrame:
-        """Equal-weight dollar-neutral: +1/n on the long picks, -1/n on the short picks."""
+        """Equal-weight dollar-neutral at unit gross exposure (like every other
+        Strategy): +0.5/n on the long picks, -0.5/n on the short picks."""
         long, short = self.select(prices)
         n = int(long.notna().sum(axis=1).iloc[0]) if len(long) else 1
         long_flags = long.notna().reindex(columns=prices.columns, fill_value=False)
         short_flags = short.notna().reindex(columns=prices.columns, fill_value=False)
-        weight = uniform(n, 1.0)
+        weight = uniform(n, 0.5)
         return (long_flags.astype(float) - short_flags.astype(float)) * weight
 
 

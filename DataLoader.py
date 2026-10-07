@@ -4,7 +4,15 @@ import pandas as pd
 import pandas_datareader.data as web
 import datetime
 
-data_path = "/Users/lucaszivkovic/ensimag/QuantResearchProjet/Project1/data/"
+# Resolved relative to this file so the project works on any machine; set
+# QUANT_DATA_PATH to point the cache somewhere else.
+data_path = os.path.join(
+    os.environ.get(
+        "QUANT_DATA_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Project1", "data"),
+    ),
+    "",
+)
 
 def getData(startDate:str, endDate:str, symbols:list, interval:str):
     path = getPath(startDate, endDate, symbols, interval)

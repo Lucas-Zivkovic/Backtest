@@ -1,5 +1,5 @@
-from pandas import DataFrame
-
+from pandas import DataFrame,Series
+from PerformanceAnalyzer import PerformanceAnalyzer
 from Strategies.Strategy import Strategy
 import Transaction
 
@@ -15,13 +15,16 @@ class BacktestEngine:
         self.impactCoef = impactCoef
         self.portfolioValue = portfolioValue
         self.signal: list[DataFrame] = []
-        self.positions: list = []
-        self.costs: list[float] = []
-        self.result: list[float] = []
+        self.positions: DataFrame = DataFrame()
+        self.costs: Series = Series()
+        self.result : Series= Series()
+        self.metrics=[]
 
     def run(self, start_date, end_date):
-
-
+        costs={}
+        returns={}
+        positions={}
+        previous_positions = None
         for date, market_data in self.data_source.iterate(start_date, end_date):
             close = market_data.xs("Close", axis=1, level=1)
 
@@ -30,7 +33,7 @@ class BacktestEngine:
             sigma = history.pct_change().std()
             avgVolume = market_data.xs("Volume", axis=1, level=1).mean()
 
-            self.signal.append(self.strategy.signal(history))
+            self.signal.append(self.strategy.cachedSignal(history))
 
             target_positions = (
                 self.strategy.positions(history).iloc[-1]
@@ -38,7 +41,8 @@ class BacktestEngine:
                 else close.iloc[-1] * 0
             )
 
-            previous_positions = self.positions[-1] if self.positions else target_positions * 0
+            if previous_positions is None:
+                previous_positions = target_positions * 0
             positions_rebalancing = target_positions - previous_positions
 
             order_size = positions_rebalancing.abs()
@@ -51,12 +55,23 @@ class BacktestEngine:
                 cost = transactioncost + spreadcost + sqrtimpact
             else:
                 cost = 0.0
-            self.costs.append(cost)
+            costs[date]=cost
 
             period_returns = close.pct_change().iloc[-1]
             step_result = float((target_positions * period_returns).sum()) - cost
-            self.result.append(step_result)
+            returns[date]=step_result
 
-            self.positions.append(target_positions)
+            positions[date] = target_positions
+            previous_positions = target_positions
 
+        self.result = Series(returns, name="return")
+        self.costs = Series(costs, name="cost")
+        self.positions = DataFrame.from_dict(positions, orient="index")
+
+        performance = PerformanceAnalyzer()
+
+        self.metrics = performance.metrics(self.result,self.positions)
         return self.result
+
+    def metric(self):
+        return self.metrics
