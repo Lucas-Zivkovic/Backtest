@@ -44,5 +44,11 @@ class OrnestUhlenbeck:
         X=prices.copy()
         x0 = self.methodMoment(X)
         res = minimize(self.llh,x0,args=(X),method='Nelder-Mead')
-        self.theta, self.sigma, self.mu = res.x
+        if not res.success:
+            # not converged: no fit rather than a wrong one, callers treat
+            # NaN theta as not mean-reverting
+            self.theta, self.sigma, self.mu = np.nan, np.nan, np.nan
+        else:
+            # sigma only enters the likelihood squared, its sign is arbitrary
+            self.theta, self.sigma, self.mu = res.x[0], abs(res.x[1]), res.x[2]
         return self.theta, self.sigma, self.mu

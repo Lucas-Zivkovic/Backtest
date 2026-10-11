@@ -172,12 +172,15 @@ def test_zScorePositions_holds_until_exit_or_stop():
     # The trade rules shared by MeanReversion and PairTrading, no data: a
     # position opened past entryZ is held through the 0.5-1.5 band, closed
     # under exitZ, stopped past stopZ, and the ADF p-value only gates entries.
+    # The fit is mu = 0, std = 1 every day, so the value is the z-score.
     strategy = ZScorePositions(entryZ=1.5, exitZ=0.5, stopZ=3.0, pValueMax=0.05)
 
-    def run(zs, pValues):
-        state, path = (0, False), []
-        for z, p in zip(zs, pValues):
-            state = strategy.nextPosition(state, z, p)
+    def run(zs, pValues, mus=None, stds=None):
+        mus = mus or [0.0] * len(zs)
+        stds = stds or [1.0] * len(zs)
+        state, path = (0, False, np.nan, np.nan), []
+        for z, p, mu, std in zip(zs, pValues, mus, stds):
+            state, _ = strategy.nextPosition(state, z, mu, std, p)
             path.append(state[0])
         return path
 
@@ -192,23 +195,43 @@ def test_zScorePositions_holds_until_exit_or_stop():
     assert run([1.6, 2.0, 0.4], [0.01, 0.5, 0.5]) == [-1, -1, 0]
     # stop past 3, then no re-entry until |z| came back under 0.5
     assert run([1.6, 3.2, 2.0, 1.6, 0.4, 1.6], ok) == [-1, 0, 0, 0, 0, -1]
-    # NaN z (OU fit not mean-reverting) keeps the position
-    assert run([1.6, np.nan, 0.4], ok[:3]) == [-1, -1, 0]
+    # no entry without a valid fit (OU not mean-reverting: NaN std)
+    assert run([1.6, 1.6], ok[:2], stds=[np.nan, 1.0]) == [0, -1]
+
+    # in a trade, z is measured against the mu/std frozen at entry:
+    # today's mu drifting up to the price is not a reversion...
+    assert run([1.6, 1.6, 1.6], ok[:3], mus=[0.0, 1.4, 1.5]) == [-1, -1, -1]
+    # ...the stop still fires when today's fit is not mean-reverting...
+    assert run([1.6, 3.2], ok[:2], stds=[1.0, np.nan]) == [-1, 0]
+    # ...and today's std shrinking does not push it past the stop
+    assert run([1.6, 2.0], ok[:2], stds=[1.0, 0.5]) == [-1, -1]
+
+    # a slow fit (half-life past maxHalfLife) cannot enter, but does not
+    # close a trade already open
+    slow = ZScorePositions(entryZ=1.5, exitZ=0.5, stopZ=3.0, pValueMax=0.05, maxHalfLife=30)
+    state, _ = slow.nextPosition((0, False, np.nan, np.nan), 1.6, 0.0, 1.0, 0.01, halfLife=60)
+    assert state[0] == 0
+    state, _ = slow.nextPosition(state, 1.6, 0.0, 1.0, 0.01, halfLife=10)
+    assert state[0] == -1
+    state, _ = slow.nextPosition(state, 1.2, 0.0, 1.0, 0.01, halfLife=60)
+    assert state[0] == -1
 
 
 def test_zScorePositions_carries_state_only_within_a_run():
     rules = ZScorePositions()
     dates = pd.bdate_range("2024-01-01", periods=5)
-    z, p = pd.Series({"A": 2.0}), pd.Series({"A": 0.01})
-    hold = pd.Series({"A": 1.0})
+    mu, std, p = pd.Series({"A": 0.0}), pd.Series({"A": 1.0}), pd.Series({"A": 0.001})
+    enter, hold = pd.Series({"A": 2.0}), pd.Series({"A": 1.0})
 
-    assert rules.update(dates[:2], z, p).loc["A", "position"] == -1
+    state = rules.update(dates[:2], enter, mu, std, p)
+    assert state.loc["A", "position"] == -1
+    assert (state.loc["A", "entryMu"], state.loc["A", "entryStd"]) == (0.0, 1.0)
     # next day of the same run: the trade is held
-    assert rules.update(dates[:3], hold, p).loc["A", "position"] == -1
+    assert rules.update(dates[:3], hold, mu, std, p).loc["A", "position"] == -1
     # same day again (signal recomputed): same answer, not a second step
-    assert rules.update(dates[:3], hold, p).loc["A", "position"] == -1
+    assert rules.update(dates[:3], hold, mu, std, p).loc["A", "position"] == -1
     # history that does not continue the last date: a new run, starts flat
-    assert rules.update(dates[:2], hold, p).loc["A", "position"] == 0
+    assert rules.update(dates[:2], hold, mu, std, p).loc["A", "position"] == 0
 
 
 @pytest.mark.parametrize("numberPair", [2,3])

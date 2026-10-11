@@ -48,18 +48,27 @@ def getData(startDate:str, endDate:str, symbols:list, interval:str):
 
     return data
 
-def getOHLCV(startDate:str, endDate:str, symbols:list, interval:str)->pd.DataFrame:
+def getOHLCV(startDate:str, endDate:str, symbols:list, interval:str, adjusted:bool=True)->pd.DataFrame:
     """Open/High/Low/Close/Volume data.
 
     For a single symbol: a flat DataFrame with those 5 columns.
     For multiple symbols: columns are (ticker, field), so data[ticker] gives
     that ticker's OHLCV DataFrame.
+
+    With `adjusted`, Open/High/Low/Close are scaled by Adj Close / Close, so
+    they include dividends: an ex-dividend date is not a price drop, and
+    Close returns are total returns. Volume is left as traded.
     """
     data = getData(startDate, endDate, symbols, interval)
     fields = ["Open", "High", "Low", "Close", "Volume"]
+    ohlcv = data[fields].copy()
+    if adjusted:
+        factor = data["Adj Close"] / data["Close"]
+        for field in ["Open", "High", "Low", "Close"]:
+            ohlcv.loc[:, field] = (data[field] * factor).values
     if len(symbols) == 1:
-        return data[fields]
-    return data[fields].swaplevel(axis=1).sort_index(axis=1)
+        return ohlcv
+    return ohlcv.swaplevel(axis=1).sort_index(axis=1)
 
 def _readCachedCsv(path:str, symbols:list):
     data = pd.read_csv(path, header=[0, 1], index_col=0, parse_dates=True)

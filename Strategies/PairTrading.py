@@ -24,11 +24,13 @@ class PairTrading(Strategy):
     entries."""
 
     def __init__(self, window, formationPrices: DataFrame, numberPair: int,
-                 entryZ: float = 1.5, exitZ: float = 0.5, stopZ: float = 3.0, pValueMax: float = 0.05):
+                 entryZ: float = 1.5, exitZ: float = 0.5, stopZ: float = 3.0, pValueMax: float = 0.01,
+                 maxHalfLife: float = None):
         self.window = window
         self.pairs = findPairs(formationPrices).head(numberPair)
         self.params = [findParameters(formationPrices, pair) for pair in self.pairs.to_dict("records")]
-        self.rules = ZScorePositions(entryZ, exitZ, stopZ, pValueMax)
+        self.rules = ZScorePositions(entryZ, exitZ, stopZ, pValueMax,
+                                     window / 2 if maxHalfLife is None else maxHalfLife)
 
     def pairNames(self) -> list[str]:
         return [f"{a}/{b}" for a, b in zip(self.pairs["a"], self.pairs["b"])]
@@ -41,29 +43,31 @@ class PairTrading(Strategy):
         return DataFrame(spreads)
 
     def signal(self, prices: DataFrame) -> DataFrame:
-        """Per pair: the `score` held after today (-1/0/+1), the `zScore`, the
-        OU `mu`/`std` it is measured against, the ADF `pValue`, `stopped`,
-        and the fixed `alpha`/`beta`."""
+        """Per pair: the `score` held after today (-1/0/+1), the `spread`,
+        today's OU `mu`/`std` and `halfLife` (days), the ADF `pValue`, `stopped`, the
+        `entryMu`/`entryStd` frozen when the open trade was entered, the
+        `zScore` the decision used (against entryMu/entryStd in a trade,
+        today's fit when flat), and the fixed `alpha`/`beta`."""
         spreads = self.spreads(prices.tail(self.window + 1))
-        rows, zScores, pValues = {}, {}, {}
+        rows = {}
         for name, (alpha, beta) in zip(self.pairNames(), self.params):
             spread = spreads[name]
-            z, mu, std, pValue = np.nan, np.nan, np.nan, np.nan
+            mu, std, halfLife, pValue = np.nan, np.nan, np.nan, np.nan
             if len(spread) == self.window + 1:
                 data = spread.iloc[:-1]
                 theta, sigma, mu = OrnestUhlenbeck().maxLikelihoodCalibration(data)
                 if theta > 0:
-                    std = abs(sigma) / np.sqrt(2 * theta)
-                    z = (spread.iloc[-1] - mu) / std
+                    std = sigma / np.sqrt(2 * theta)
+                    halfLife = np.log(2) / theta
                 pValue = adfuller(data)[1]
+            rows[name] = {"spread": spread.iloc[-1], "mu": mu, "std": std, "halfLife": halfLife, "pValue": pValue,
+                          "alpha": alpha, "beta": beta}
 
-            zScores[name], pValues[name] = z, pValue
-            rows[name] = {"zScore": z, "mu": mu, "std": std, "pValue": pValue, "alpha": alpha, "beta": beta}
-
-        state = self.rules.update(prices.index, pd.Series(zScores, dtype=float), pd.Series(pValues, dtype=float))
-        diagnostics = DataFrame(rows, index=["zScore", "mu", "std", "pValue", "alpha", "beta"]).T
+        diagnostics = DataFrame(rows, index=["spread", "mu", "std", "halfLife", "pValue", "alpha", "beta"]).T.astype(float)
+        state = self.rules.update(prices.index, diagnostics["spread"], diagnostics["mu"],
+                                  diagnostics["std"], diagnostics["pValue"], diagnostics["halfLife"])
         diagnostics.insert(0, "score", state["position"])
-        diagnostics["stopped"] = state["stopped"]
+        diagnostics[["stopped", "zScore", "entryMu", "entryStd"]] = state[["stopped", "zScore", "entryMu", "entryStd"]]
         diagnostics.index.name = "ticker"
         signal = diagnostics.stack(future_stack=True).to_frame().T.astype(float)
         signal.index = [prices.index[-1]]
