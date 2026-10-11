@@ -1,4 +1,8 @@
+import hashlib
+import io
 import os
+
+import requests
 import yfinance as yf
 import pandas as pd
 import pandas_datareader.data as web
@@ -78,7 +82,41 @@ def _readCachedCsv(path:str, symbols:list):
 
 def getPath(startDate:str, endDate:str, symbols:list, interval:str)->str:
     datastr = '_'.join(str(s) for s in symbols)
+    if len(datastr) > 150:
+        # a file name is limited to 255 characters: name long universes by
+        # their size and a hash of the symbols instead
+        digest = hashlib.sha1(datastr.encode()).hexdigest()[:12]
+        datastr = f"{len(symbols)}tickers_{digest}"
     return f"{data_path}{datastr}_{startDate}_{endDate}_{interval}.csv".replace(' ', '')
+
+def getSP500Constituents()->pd.DataFrame:
+    """Current S&P 500 members from Wikipedia: columns Symbol (in Yahoo
+    format, BRK.B -> BRK-B), Security, Sector, SubIndustry. Downloaded once
+    and cached as sp500_constituents.csv in the data folder. These are
+    today's members: a backtest on them has survivorship bias, it never
+    holds a company that was dropped from the index or went bankrupt."""
+    path = f"{data_path}sp500_constituents.csv"
+    if os.path.exists(path):
+        return pd.read_csv(path)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    try:
+        # Wikipedia refuses requests without a browser-like user agent
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        response.raise_for_status()
+        table = pd.read_html(io.StringIO(response.text), attrs={"id": "constituents"})[0]
+    except Exception as exc:
+        raise RuntimeError(f"Failed to download the S&P 500 constituents from {url}") from exc
+
+    constituents = pd.DataFrame({
+        "Symbol": table["Symbol"].str.replace(".", "-", regex=False),
+        "Security": table["Security"],
+        "Sector": table["GICS Sector"],
+        "SubIndustry": table["GICS Sub-Industry"],
+    })
+    constituents.to_csv(path, index=False)
+    return constituents
 
 def removeAll():
     removeList = os.listdir(data_path)

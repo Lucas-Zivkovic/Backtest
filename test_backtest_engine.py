@@ -11,8 +11,9 @@ import DataLoader
 from BacktestEngine import BacktestEngine
 from Strategies.CrossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from Strategies.MeanReversion import MeanReversion
-from Strategies.PairFinding import PairFinding, findPairs
+from Strategies.PairFinding import PairFinding, findPairs, findParameters, johansen
 from Strategies.PairTrading import PairTrading
+from Strategies.VolatilityTarget import VolatilityTarget
 from Strategies.ZScorePositions import ZScorePositions
 from Strategies.PortfolioCombiner.Uniform import Uniform
 from Strategies.PortfolioCombiner.InvVol import InvVol
@@ -80,7 +81,7 @@ def test_backtestEngine_on_real_data_meanReversion():
     dates = ohlcv.index
 
     window = 120
-    warmup = len(dates)-200 # only backtest the last 80 days: OU calibration is per-step, per-ticker
+    warmup = 200 # only backtest the last 80 days: OU calibration is per-step, per-ticker
 
     strategy = MeanReversion(window=window)
     engine = BacktestEngine(strategy, InMemoryDataSource(ohlcv), transactionCostRate=0.0005)
@@ -141,9 +142,10 @@ def test_meanReversion_window_search():
 
 def test_pairFinding_on_real_data():
     # Clusters PAIR_TICKERS with PairFinding (correlation distance -> PCA ->
-    # DBSCAN) over 2013-2025, then findPairs ranks every pair inside a cluster
-    # by its Engle-Granger cointegration p-value on log prices. Correlation is
-    # measured on daily returns: prices trend, so their correlation is spurious.
+    # DBSCAN) over 2013-2025, then findPairs tests every pair inside a cluster
+    # with the Johansen trace test on log prices, over the whole period and
+    # each half. Correlation is measured on daily returns: prices trend, so
+    # their correlation is spurious.
     ohlcv = DataLoader.getOHLCV("2013-01-01", "2025-01-01", PAIR_TICKERS, "1d").dropna()
     close = ohlcv.xs("Close", axis=1, level=1)[PAIR_TICKERS]
     returns = close.pct_change().dropna()
@@ -156,8 +158,17 @@ def test_pairFinding_on_real_data():
 
     pairs = findPairs(close)
     assert not pairs.empty
-    assert pairs["pValue"].is_monotonic_increasing
     assert (clusters[pairs["a"]].values == clusters[pairs["b"]].values).all()
+    weakest = pairs[["strength", "strengthFirst", "strengthSecond"]].min(axis=1)
+    assert (pairs["stable"] == ((weakest > 1) & (pairs["beta"] > 0))).all()
+    assert pairs["stable"].is_monotonic_decreasing  # stable pairs first
+
+    # Johansen does not depend on which leg comes first, unlike Engle-Granger
+    a, b = pairs.loc[0, "a"], pairs.loc[0, "b"]
+    logClose = np.log(close)
+    strengthAB, betaAB = johansen(logClose[a], logClose[b])
+    strengthBA, betaBA = johansen(logClose[b], logClose[a])
+    assert np.isclose(strengthAB, strengthBA) and np.isclose(betaAB * betaBA, 1.0)
 
     print(f"\nclusters:\n{clusters.sort_values().to_string()}\n\npairs:\n{pairs.to_string()}")
 
@@ -234,50 +245,114 @@ def test_zScorePositions_carries_state_only_within_a_run():
     assert rules.update(dates[:2], hold, mu, std, p).loc["A", "position"] == 0
 
 
-@pytest.mark.parametrize("numberPair", [2,3])
+@pytest.mark.parametrize("numberPair", [1,2])
 def test_backtestEngine_on_real_data_pairTrading(numberPair):
-    # Pairs and hedge ratios are fixed on 2013-2019 and traded on 2020-2024,
-    # so the selection never sees the returns it is scored on. The OU process
-    # is refitted per pair per step, so this is slow: about 1250 steps with up
-    # to numberPair fits each.
+    # PAIR_TICKERS, candidates paired inside the PairFinding clusters.
     ohlcv = DataLoader.getOHLCV("2013-01-01", "2025-01-01", PAIR_TICKERS, "1d").dropna()
-    close = ohlcv.xs("Close", axis=1, level=1)[PAIR_TICKERS]
-    dates = ohlcv.index
-    formation = close.loc[:"2019-12-31"]
-    warmup = len(formation)
+    _backtest_pair_trading(
+        ohlcv, PairTrading(numberPair=numberPair, formationDays=5 * 252, refitDays=2 * 252),
+        f"OU pair trading on {len(PAIR_TICKERS)} large-caps, {numberPair} pairs re-selected every 2 years, 2020-2024",
+        f"backtestEngine_pairTrading_{numberPair}pairs.png",
+    )
 
-    strategy = PairTrading(window=120, formationPrices=formation, numberPair=numberPair)
-    print(f"\npairs:\n{strategy.pairs.to_string()}")
-    assert 0 < len(strategy.pairs) <= numberPair  # fewer if the clusters hold fewer pairs
+
+@pytest.mark.parametrize("numberPair", [30, 50])
+def test_backtestEngine_on_sp500_pairTrading(numberPair):
+    # Current S&P 500 members with a full 2010-2024 history (survivorship
+    # bias: companies dropped from the index are missing), candidates paired
+    # inside each GICS sub-industry: ~1400 candidate pairs instead of ~35.
+    # Traded on 2015-2024, 5 formations; the first uses 2010-2014.
+    # Stocks trading under $5M a day before 2015 are left out: their early
+    # history is not the S&P 500 company (e.g. a pre-merger listing), and the
+    # square-root impact makes them very expensive. Only pre-2015 data is
+    # used for this, so it does not look ahead into the backtest.
+    # The book is scaled to 10% expected annual volatility, gross capped at 4.
+    constituents = DataLoader.getSP500Constituents()
+    ohlcv = DataLoader.getOHLCV("2010-01-01", "2025-01-01", list(constituents["Symbol"]), "1d")
+    close = ohlcv.xs("Close", axis=1, level=1)
+    volume = ohlcv.xs("Volume", axis=1, level=1)
+    dollarVolume = (close * volume).loc[:"2014-12-31"].median()
+    universe = [t for t in close.columns if close[t].notna().all() and dollarVolume[t] > 5e6]
+    ohlcv = ohlcv[universe]
+    print(f"\nuniverse: {len(universe)} of {len(close.columns)} tickers")
+    assert len(universe) > 350
+
+    groups = constituents.set_index("Symbol")["SubIndustry"]
+    pairTrading = PairTrading(numberPair=numberPair, formationDays=5 * 252, refitDays=2 * 252, groups=groups)
+    strategy = VolatilityTarget(pairTrading, targetVol=0.10, lookback=60, maxGross=4.0)
+    _backtest_pair_trading(
+        ohlcv, strategy,
+        f"OU pair trading on {len(universe)} S&P 500 stocks by sub-industry, "
+        f"{numberPair} pairs re-selected every 2 years, 10% vol target, 2015-2024",
+        f"backtestEngine_pairTrading_sp500_{numberPair}pairs.png",
+        start="2015-01-01",
+    )
+    # every pair is two stocks of the same sub-industry
+    for pairs in pairTrading.formations.values():
+        assert (groups[pairs["a"]].values == groups[pairs["b"]].values).all()
+
+
+def _backtest_pair_trading(ohlcv, strategy, title, filename, start="2020-01-01"):
+    # Traded from `start` to the end of the data. Pairs, hedge ratios and the
+    # OU mean/std of each spread are re-fitted every refitDays on the
+    # formationDays before, from the history the engine hands the strategy,
+    # so no formation sees a price after the day it is made. Only stable
+    # pairs (Johansen cointegrated on the whole formation and on each half)
+    # are traded; a formation may find none, and then the strategy stays in
+    # cash until the next one. `strategy` is a PairTrading, or a
+    # VolatilityTarget around one (gross then capped at its maxGross).
+    pairStrategy = strategy.strategy if isinstance(strategy, VolatilityTarget) else strategy
+    maxGross = strategy.maxGross if isinstance(strategy, VolatilityTarget) else 1.0
+    close = ohlcv.xs("Close", axis=1, level=1)
+    dates = ohlcv.index
+    warmup = int(np.searchsorted(dates, pd.Timestamp(start)))
 
     engine = BacktestEngine(strategy, InMemoryDataSource(ohlcv), transactionCostRate=0.0005)
     results = engine.run(dates[warmup], dates[-1])
 
+    for formedOn, pairs in pairStrategy.formations.items():
+        print(f"\nformation on {formedOn.date()}: {len(pairs)} stable pairs\n{pairs.to_string()}")
+
     n_steps = len(close) - warmup
     step_dates = dates[warmup:]
-    assert step_dates[0] > formation.index[-1]
     assert len(results) == n_steps
     assert len(engine.positions) == n_steps
     assert all(c >= 0 for c in engine.costs)
 
+    # one formation at the start, then one every refitDays steps, each on
+    # history that ends before the first day it trades
+    formedOn = list(pairStrategy.formations)
+    assert len(formedOn) == 1 + (n_steps - 1) // pairStrategy.refitDays
+    assert formedOn[0] == dates[warmup - 1]
+    for pairs in pairStrategy.formations.values():
+        assert len(pairs) <= pairStrategy.numberPair  # fewer, or none, if fewer pairs are stable
+        assert pairs["stable"].all()
+        assert {"mu", "std", "halfLife", "alpha", "beta"} <= set(pairs.columns)
+
     # only tickers that belong to a selected pair are ever traded
-    pairTickers = set(strategy.pairs["a"]) | set(strategy.pairs["b"])
+    pairTickers = set().union(*(set(p["a"]) | set(p["b"]) for p in pairStrategy.formations.values()))
     others = [t for t in engine.positions.columns if t not in pairTickers]
     assert (engine.positions[others] == 0).all().all()
 
     gross = engine.positions.abs().sum(axis=1)
-    assert (gross <= 1.0 + 1e-9).all()
+    assert (gross <= maxGross + 1e-9).all()
 
     period_returns = close.pct_change()
     for i, date in enumerate(step_dates):
         expected_gross = float((engine.positions.iloc[i] * period_returns.loc[date]).sum())
         assert np.isclose(results.iloc[i], expected_gross - engine.costs.iloc[i])
 
+    def label(pairs):
+        names = [f"{a}/{b}" for a, b in zip(pairs["a"], pairs["b"])]
+        if not names:
+            return "no stable pair"
+        return f"{len(names)} pairs: " + ", ".join(names[:4]) + (", ..." if len(names) > 4 else "")
+
     _plot_backtest(
-        step_dates, results, engine.costs, engine.metrics,
-        f"BacktestEngine — OU pair trading on the {len(strategy.pairs)} most cointegrated pairs, 2020-2024",
-        f"backtestEngine_pairTrading_{numberPair}pairs.png",
+        step_dates, results, engine.costs, engine.metrics, f"BacktestEngine — {title}", filename,
+        events={d: label(p) for d, p in pairStrategy.formations.items()},
     )
+    return pairStrategy
 
 
 def test_backtestEngine_on_real_data_uniformCombiner():
@@ -415,7 +490,8 @@ def _backtest_calibrated_combiner(combiner_cls, label, filename):
     )
     return strategy
 
-def _plot_backtest(dates, results, costs,metrics:pd.DataFrame, title, filename):
+def _plot_backtest(dates, results, costs,metrics:pd.DataFrame, title, filename, events: dict = None):
+    # events: optional {date: label}, drawn as dashed vertical lines
     results = pd.Series(results, index=dates)
     costs = pd.Series(costs, index=dates)
     cumulative = (1 + results).cumprod()
@@ -427,6 +503,10 @@ def _plot_backtest(dates, results, costs,metrics:pd.DataFrame, title, filename):
 
     ax_cum.plot(cumulative.index, cumulative.values, color="tab:blue")
     ax_cum.set_title(title)
+    for date, label in (events or {}).items():
+        ax_cum.axvline(date, color="gray", linestyle="--", linewidth=0.8)
+        ax_cum.annotate(label, xy=(date, 0.02), xycoords=("data", "axes fraction"),
+                        rotation=90, fontsize=7, color="gray", ha="right", va="bottom")
     ax_cum.set_ylabel("Growth of $1")
     ax_cum.text(
         0.01, 0.98,
@@ -495,9 +575,8 @@ def _plot_pairs(close: pd.DataFrame, returns: pd.DataFrame, clusters: pd.Series,
 
     best = pairs.iloc[0]
     a, b = best["a"], best["b"]
-    log_a, log_b = np.log(close[a]), np.log(close[b])
-    beta, alpha = np.polyfit(log_b, log_a, 1)
-    spread = log_a - beta * log_b - alpha
+    alpha, beta = findParameters(close, best)
+    spread = np.log(close[a]) - beta * np.log(close[b]) - alpha
     zscore = (spread - spread.mean()) / spread.std()
 
     os.makedirs(PLOT_DIR, exist_ok=True)
@@ -520,14 +599,17 @@ def _plot_pairs(close: pd.DataFrame, returns: pd.DataFrame, clusters: pd.Series,
     ax_price = fig.add_subplot(grid[0, 1])
     ax_price.plot(close.index, close[a] / close[a].iloc[0], label=a)
     ax_price.plot(close.index, close[b] / close[b].iloc[0], label=b)
-    ax_price.set_title(f"Best pair {a} / {b}: cluster {best['cluster']}, coint p-value {best['pValue']:.4f}")
+    ax_price.set_title(f"Best pair {a} / {b}: cluster {best['cluster']}, "
+                       f"{'stable' if best['stable'] else 'NOT stable'}, Johansen trace / crit "
+                       f"{best['strength']:.2f} (halves {best['strengthFirst']:.2f}, {best['strengthSecond']:.2f})")
     ax_price.set_ylabel("Price / first price")
     ax_price.legend(loc="upper left")
     ax_price.text(
         0.99, 0.98,
-        "Top pairs (p-value)\n" + "\n".join(
-            f"{r.a}/{r.b}: {r.pValue:.4f}" for r in pairs.head(10).itertuples()
-        ),
+        "Top pairs: trace / crit (whole, 1st half, 2nd half)\n" + "\n".join(
+            f"{'*' if r.stable else ' '} {r.a}/{r.b}: {r.strength:.2f}, {r.strengthFirst:.2f}, {r.strengthSecond:.2f}"
+            for r in pairs.head(10).itertuples()
+        ) + "\n* stable: > 1 on all three",
         transform=ax_price.transAxes, va="top", ha="right", fontsize=8,
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
     )

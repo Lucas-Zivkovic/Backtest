@@ -24,6 +24,8 @@ class PerformanceAnalyzer:
             "payoffRatio": Metrics.payoffRatio(returns),
             "expectancy": Metrics.expectancy(returns),
             "annualizedTurnover": Metrics.annualizedTurnover(positions.values, self.periodsPerYear),
+            "daysInvested": Metrics.daysInvested(positions.values),
+            "daysTraded": Metrics.daysTraded(positions.values),
             "totalReturn": cumulative.iloc[-1] - 1,
             "mu":returns.mean(),
             "sigma":returns.std(),

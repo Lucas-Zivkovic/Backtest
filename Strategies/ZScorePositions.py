@@ -60,7 +60,7 @@ class ZScorePositions:
             return (-int(np.sign(z)), False, mu, std), z
         return FLAT, z
 
-    def update(self, dates: Index, value: Series, mu: Series, std: Series, pValue: Series,
+    def update(self, dates: Index, value: Series, mu: Series, std: Series, pValue: Series = None,
                halfLife: Series = None) -> DataFrame:
         """State after the last of `dates`, one row per key of `value`, with
         columns `position`, `stopped`, `zScore` (the z the decision used),
@@ -68,7 +68,10 @@ class ZScorePositions:
         was handed: the state carries over only when its second to last date
         is the last date seen (the next step of the same run), is recomputed
         from the same start when the last date is seen again, and starts flat
-        otherwise (a new run). Without `halfLife`, it does not gate entries."""
+        otherwise (a new run). Without `pValue` or `halfLife`, that check does
+        not gate entries."""
+        if pValue is None:
+            pValue = Series(0.0, index=value.index)
         if halfLife is None:
             halfLife = Series(0.0, index=value.index)
         date = dates[-1]
