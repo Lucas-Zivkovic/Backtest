@@ -8,15 +8,28 @@ import pandas as pd
 import pytest
 
 import DataLoader
-import Metrics
 from BacktestEngine import BacktestEngine
 from Strategies.CrossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from Strategies.MeanReversion import MeanReversion
+from Strategies.PairFinding import PairFinding, findPairs
+from Strategies.PairTrading import PairTrading
+from Strategies.ZScorePositions import ZScorePositions
 from Strategies.PortfolioCombiner.Uniform import Uniform
 from Strategies.PortfolioCombiner.InvVol import InvVol
 from Strategies.PortfolioCombiner.RiskParity import RiskParity
 
 REAL_TICKERS = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "JPM", "XOM", "JNJ", "PG", "V", "UNH"]
+
+# Wider universe for pair finding: several names per sector so DBSCAN has
+# groups to find. All listed before 2013, so dropna() keeps the full period.
+PAIR_TICKERS = [
+    "AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "INTC", "ORCL", "CSCO",  # tech
+    "JPM", "BAC", "C", "WFC", "GS", "MS",                                    # banks
+    "XOM", "CVX", "COP", "SLB", "EOG",                                       # energy
+    "JNJ", "PFE", "MRK", "ABT", "LLY",                                       # pharma
+    "PG", "KO", "PEP", "CL", "WMT",                                          # staples
+    "DUK", "SO", "NEE", "AEP", "D",                                          # utilities
+]
 
 PLOT_DIR = os.path.join(os.path.dirname(__file__), "plots")
 
@@ -89,6 +102,158 @@ def test_backtestEngine_on_real_data_meanReversion():
         step_dates, results, engine.costs,engine.metrics,
         f"BacktestEngine — OU mean reversion on {len(tickers)} large-caps",
         "backtestEngine_meanReversion_realData.png",
+    )
+
+
+def test_meanReversion_window_search():
+    # Backtests MeanReversion for several OU calibration windows over the same
+    # evaluation period and picks the window with the best Sharpe ratio. The
+    # choice is in-sample: the best window is selected on the returns it is
+    # scored on. OU calibration is per-step, per-ticker, so the period is kept
+    # short; it must start after the largest window has enough history.
+    ohlcv = DataLoader.getOHLCV("2015-01-01", "2023-01-01", REAL_TICKERS, "1d").dropna()
+    dates = ohlcv.index
+    data_source = InMemoryDataSource(ohlcv)
+
+    windows = [30, 60, 90, 120, 180, 252]
+    warmup = len(dates) - 200
+    assert warmup > max(windows)
+    step_dates = dates[warmup:]
+
+    results, metrics = {}, {}
+    for window in windows:
+        engine = BacktestEngine(MeanReversion(window=window), data_source, transactionCostRate=0.0005)
+        results[window] = engine.run(dates[warmup], dates[-1])
+        metrics[window] = engine.metrics["value"]
+        assert len(results[window]) == len(step_dates)
+        assert all(c >= 0 for c in engine.costs)
+
+    metrics = pd.DataFrame(metrics)  # rows: metric, columns: window
+    best = metrics.loc["sharpeRatio"].idxmax()
+    print(f"\n{metrics.to_string()}\nbest window (Sharpe): {best}")
+
+    _plot_window_search(
+        step_dates, results, metrics, best,
+        f"MeanReversion window search on {len(REAL_TICKERS)} large-caps (best by Sharpe: {best})",
+        "meanReversion_windowSearch.png",
+    )
+
+
+def test_pairFinding_on_real_data():
+    # Clusters PAIR_TICKERS with PairFinding (correlation distance -> PCA ->
+    # DBSCAN) over 2013-2025, then findPairs ranks every pair inside a cluster
+    # by its Engle-Granger cointegration p-value on log prices. Correlation is
+    # measured on daily returns: prices trend, so their correlation is spurious.
+    ohlcv = DataLoader.getOHLCV("2013-01-01", "2025-01-01", PAIR_TICKERS, "1d").dropna()
+    close = ohlcv.xs("Close", axis=1, level=1)[PAIR_TICKERS]
+    returns = close.pct_change().dropna()
+
+    clusters = PairFinding(returns)
+
+    assert list(clusters.index) == PAIR_TICKERS
+    assert (clusters >= -1).all()
+    assert (clusters >= 0).any(), "DBSCAN put every ticker in noise (-1); tune eps/min_samples"
+
+    pairs = findPairs(close)
+    assert not pairs.empty
+    assert pairs["pValue"].is_monotonic_increasing
+    assert (clusters[pairs["a"]].values == clusters[pairs["b"]].values).all()
+
+    print(f"\nclusters:\n{clusters.sort_values().to_string()}\n\npairs:\n{pairs.to_string()}")
+
+    _plot_pairs(
+        close, returns, clusters, pairs,
+        f"PairFinding on {len(PAIR_TICKERS)} large-caps, 2013-2025",
+        "pairFinding_realData.png",
+    )
+
+
+def test_zScorePositions_holds_until_exit_or_stop():
+    # The trade rules shared by MeanReversion and PairTrading, no data: a
+    # position opened past entryZ is held through the 0.5-1.5 band, closed
+    # under exitZ, stopped past stopZ, and the ADF p-value only gates entries.
+    strategy = ZScorePositions(entryZ=1.5, exitZ=0.5, stopZ=3.0, pValueMax=0.05)
+
+    def run(zs, pValues):
+        state, path = (0, False), []
+        for z, p in zip(zs, pValues):
+            state = strategy.nextPosition(state, z, p)
+            path.append(state[0])
+        return path
+
+    ok = [0.01] * 6
+    # z rises past 1.5: short the spread, held while it reverts, closed under 0.5
+    assert run([1.0, 1.6, 1.4, 1.0, 0.6, 0.4], ok) == [0, -1, -1, -1, -1, 0]
+    # negative side: long the spread
+    assert run([-1.6, -1.2, -0.3], ok[:3]) == [1, 1, 0]
+    # no entry when the spread is not stationary
+    assert run([1.6, 2.0], [0.5, 0.5]) == [0, 0]
+    # a failing ADF test does not close an open trade
+    assert run([1.6, 2.0, 0.4], [0.01, 0.5, 0.5]) == [-1, -1, 0]
+    # stop past 3, then no re-entry until |z| came back under 0.5
+    assert run([1.6, 3.2, 2.0, 1.6, 0.4, 1.6], ok) == [-1, 0, 0, 0, 0, -1]
+    # NaN z (OU fit not mean-reverting) keeps the position
+    assert run([1.6, np.nan, 0.4], ok[:3]) == [-1, -1, 0]
+
+
+def test_zScorePositions_carries_state_only_within_a_run():
+    rules = ZScorePositions()
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    z, p = pd.Series({"A": 2.0}), pd.Series({"A": 0.01})
+    hold = pd.Series({"A": 1.0})
+
+    assert rules.update(dates[:2], z, p).loc["A", "position"] == -1
+    # next day of the same run: the trade is held
+    assert rules.update(dates[:3], hold, p).loc["A", "position"] == -1
+    # same day again (signal recomputed): same answer, not a second step
+    assert rules.update(dates[:3], hold, p).loc["A", "position"] == -1
+    # history that does not continue the last date: a new run, starts flat
+    assert rules.update(dates[:2], hold, p).loc["A", "position"] == 0
+
+
+@pytest.mark.parametrize("numberPair", [2,3])
+def test_backtestEngine_on_real_data_pairTrading(numberPair):
+    # Pairs and hedge ratios are fixed on 2013-2019 and traded on 2020-2024,
+    # so the selection never sees the returns it is scored on. The OU process
+    # is refitted per pair per step, so this is slow: about 1250 steps with up
+    # to numberPair fits each.
+    ohlcv = DataLoader.getOHLCV("2013-01-01", "2025-01-01", PAIR_TICKERS, "1d").dropna()
+    close = ohlcv.xs("Close", axis=1, level=1)[PAIR_TICKERS]
+    dates = ohlcv.index
+    formation = close.loc[:"2019-12-31"]
+    warmup = len(formation)
+
+    strategy = PairTrading(window=120, formationPrices=formation, numberPair=numberPair)
+    print(f"\npairs:\n{strategy.pairs.to_string()}")
+    assert 0 < len(strategy.pairs) <= numberPair  # fewer if the clusters hold fewer pairs
+
+    engine = BacktestEngine(strategy, InMemoryDataSource(ohlcv), transactionCostRate=0.0005)
+    results = engine.run(dates[warmup], dates[-1])
+
+    n_steps = len(close) - warmup
+    step_dates = dates[warmup:]
+    assert step_dates[0] > formation.index[-1]
+    assert len(results) == n_steps
+    assert len(engine.positions) == n_steps
+    assert all(c >= 0 for c in engine.costs)
+
+    # only tickers that belong to a selected pair are ever traded
+    pairTickers = set(strategy.pairs["a"]) | set(strategy.pairs["b"])
+    others = [t for t in engine.positions.columns if t not in pairTickers]
+    assert (engine.positions[others] == 0).all().all()
+
+    gross = engine.positions.abs().sum(axis=1)
+    assert (gross <= 1.0 + 1e-9).all()
+
+    period_returns = close.pct_change()
+    for i, date in enumerate(step_dates):
+        expected_gross = float((engine.positions.iloc[i] * period_returns.loc[date]).sum())
+        assert np.isclose(results.iloc[i], expected_gross - engine.costs.iloc[i])
+
+    _plot_backtest(
+        step_dates, results, engine.costs, engine.metrics,
+        f"BacktestEngine — OU pair trading on the {len(strategy.pairs)} most cointegrated pairs, 2020-2024",
+        f"backtestEngine_pairTrading_{numberPair}pairs.png",
     )
 
 
@@ -262,9 +427,113 @@ def _plot_backtest(dates, results, costs,metrics:pd.DataFrame, title, filename):
     assert os.path.exists(out_path)
 
 
+def _plot_window_search(dates, results: dict, metrics: pd.DataFrame, best, title, filename):
+    # Top: growth of $1 for every window. Below: one bar chart per metric,
+    # windows on the x axis, the best window highlighted.
+    n_cols = 4
+    n_rows = -(-len(metrics.index) // n_cols)
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    fig = plt.figure(figsize=(16, 4 + 2.6 * n_rows))
+    grid = fig.add_gridspec(n_rows + 1, n_cols, height_ratios=[2.2] + [1] * n_rows)
+
+    ax_cum = fig.add_subplot(grid[0, :])
+    for window, result in results.items():
+        cumulative = (1 + pd.Series(result, index=dates)).cumprod()
+        ax_cum.plot(cumulative.index, cumulative.values,
+                    linewidth=2.5 if window == best else 1.2, label=f"window={window}")
+    ax_cum.set_title(title)
+    ax_cum.set_ylabel("Growth of $1")
+    ax_cum.legend(loc="upper left", fontsize=9)
+
+    labels = [str(w) for w in metrics.columns]
+    colors = ["tab:orange" if w == best else "tab:blue" for w in metrics.columns]
+    for i, name in enumerate(metrics.index):
+        ax = fig.add_subplot(grid[1 + i // n_cols, i % n_cols])
+        ax.bar(labels, metrics.loc[name].values, color=colors)
+        ax.set_title(name, fontsize=10)
+        ax.tick_params(labelsize=8)
+        ax.axhline(0, color="black", linewidth=0.6)
+    fig.supxlabel("OU calibration window (days)")
+
+    fig.tight_layout()
+    out_path = os.path.join(PLOT_DIR, filename)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+    assert os.path.exists(out_path)
+
+
+def _plot_pairs(close: pd.DataFrame, returns: pd.DataFrame, clusters: pd.Series, pairs: pd.DataFrame, title, filename):
+    # Left: return correlation matrix, tickers sorted by cluster, with the
+    # cluster boundaries drawn. Right: the most cointegrated pair, its
+    # normalized prices and the z-score of its log-price spread.
+    order = clusters.sort_values(kind="stable").index
+    corr = returns[order].corr()
+
+    best = pairs.iloc[0]
+    a, b = best["a"], best["b"]
+    log_a, log_b = np.log(close[a]), np.log(close[b])
+    beta, alpha = np.polyfit(log_b, log_a, 1)
+    spread = log_a - beta * log_b - alpha
+    zscore = (spread - spread.mean()) / spread.std()
+
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    fig = plt.figure(figsize=(18, 10))
+    grid = fig.add_gridspec(2, 2, width_ratios=[1, 1.3])
+    fig.suptitle(title)
+
+    ax_corr = fig.add_subplot(grid[:, 0])
+    im = ax_corr.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    labels = [f"{t} ({clusters[t]})" for t in order]
+    ax_corr.set_xticks(range(len(order)), labels, rotation=90, fontsize=7)
+    ax_corr.set_yticks(range(len(order)), labels, fontsize=7)
+    sorted_labels = clusters[order].values
+    for i in np.where(sorted_labels[1:] != sorted_labels[:-1])[0]:
+        ax_corr.axhline(i + 0.5, color="black", linewidth=0.8)
+        ax_corr.axvline(i + 0.5, color="black", linewidth=0.8)
+    ax_corr.set_title("Return correlation by cluster (-1 = noise)")
+    fig.colorbar(im, ax=ax_corr, fraction=0.046, pad=0.04)
+
+    ax_price = fig.add_subplot(grid[0, 1])
+    ax_price.plot(close.index, close[a] / close[a].iloc[0], label=a)
+    ax_price.plot(close.index, close[b] / close[b].iloc[0], label=b)
+    ax_price.set_title(f"Best pair {a} / {b}: cluster {best['cluster']}, coint p-value {best['pValue']:.4f}")
+    ax_price.set_ylabel("Price / first price")
+    ax_price.legend(loc="upper left")
+    ax_price.text(
+        0.99, 0.98,
+        "Top pairs (p-value)\n" + "\n".join(
+            f"{r.a}/{r.b}: {r.pValue:.4f}" for r in pairs.head(10).itertuples()
+        ),
+        transform=ax_price.transAxes, va="top", ha="right", fontsize=8,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+    ax_spread = fig.add_subplot(grid[1, 1], sharex=ax_price)
+    ax_spread.plot(zscore.index, zscore.values, color="tab:purple", linewidth=0.8)
+    for level, style in [(0, "-"), (2, "--"), (-2, "--")]:
+        ax_spread.axhline(level, color="black", linestyle=style, linewidth=0.7)
+    ax_spread.set_title(f"Spread z-score: log {a} - {beta:.3f} log {b}")
+    ax_spread.set_ylabel("z-score")
+    ax_spread.set_xlabel("Date")
+
+    fig.tight_layout()
+    out_path = os.path.join(PLOT_DIR, filename)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+    assert os.path.exists(out_path)
+
+
 if __name__ == "__main__":
     test_backtestEngine_on_real_data()
     test_backtestEngine_on_real_data_meanReversion()
+    test_meanReversion_window_search()
+    test_pairFinding_on_real_data()
+    test_zScorePositions_holds_until_exit_or_stop()
+    test_zScorePositions_carries_state_only_within_a_run()
+    test_backtestEngine_on_real_data_pairTrading(5)
+    test_backtestEngine_on_real_data_pairTrading(10)
     test_backtestEngine_on_real_data_uniformCombiner()
     test_backtestEngine_on_real_data_invVolCombiner()
     test_backtestEngine_on_real_data_riskParityCombiner()
