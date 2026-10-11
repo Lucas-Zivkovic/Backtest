@@ -34,7 +34,7 @@ def annualizedTurnover(weights,periodsPerYears=252):
     return np.mean(turnovers)*periodsPerYears
 
 def hitRatio(returns):
-    return (returns>0).sum()/len(returns)
+    return (returns>0).sum()/len(returns[returns != 0])
 
 def payoffRatio(returns):
     wins = returns[returns > 0]
