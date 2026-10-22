@@ -51,7 +51,9 @@ class BacktestEngine:
                 shares_traded = order_size * self.portfolioValue / close.iloc[-1]
                 transactioncost = Transaction.transactionCost(turnover, minValue=0, pourcentage=self.transactionCostRate)
                 spreadcost = Transaction.spreadCost(self.spread, order_size).sum()
-                sqrtimpact = Transaction.sqrt_impact(shares_traded, avgVolume, sigma, self.impactCoef).sum()
+                # sqrt_impact is the price move on the traded amount, as a
+                # fraction of it: weight it by the fraction of the book traded
+                sqrtimpact = (order_size * Transaction.sqrt_impact(shares_traded, avgVolume, sigma, self.impactCoef)).sum()
                 cost = transactioncost + spreadcost + sqrtimpact
             else:
                 cost = 0.0
