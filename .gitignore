@@ -9,3 +9,7 @@ __pycache__/
 # Environment and IDE
 .venv/
 .idea/
+.vscode/
+
+# Downloaded market data (cache, re-created on first run)
+data/

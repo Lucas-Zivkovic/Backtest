@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import DataLoader
+import strategies
 from BacktestEngine import BacktestEngine
 from Strategies.CrossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from Strategies.MeanReversion import MeanReversion
@@ -34,6 +35,11 @@ PAIR_TICKERS = [
 
 PLOT_DIR = os.path.join(os.path.dirname(__file__), "plots")
 
+# Date range with Fama-French factors, AAPL and ^GSPC already in the data
+# cache, so the Fama-French tests on real data do not need the network.
+FF_START, FF_END = "2011-01-01", "2026-08-01"
+FF_FACTORS = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "Mom"]
+
 
 class InMemoryDataSource:
     """Feeds BacktestEngine a growing window of price history, one date at a time."""
@@ -47,6 +53,7 @@ class InMemoryDataSource:
             yield self.prices.index[i], self.prices.iloc[: i + 1]
 
 
+@pytest.mark.realdata
 def test_backtestEngine_on_real_data():
     ohlcv = DataLoader.getOHLCV("2015-01-01", "2023-01-01", REAL_TICKERS, "1d").dropna()
     close = ohlcv.xs("Close", axis=1, level=1)
@@ -70,6 +77,7 @@ def test_backtestEngine_on_real_data():
     )
 
 
+@pytest.mark.realdata
 def test_backtestEngine_on_real_data_meanReversion():
     # Same real-data setup as test_backtestEngine_on_real_data (reuses the
     # cached download), but with MeanReversion. Its signal() recalibrates an
@@ -106,6 +114,7 @@ def test_backtestEngine_on_real_data_meanReversion():
     )
 
 
+@pytest.mark.realdata
 def test_meanReversion_window_search():
     # Backtests MeanReversion for several OU calibration windows over the same
     # evaluation period and picks the window with the best Sharpe ratio. The
@@ -140,6 +149,7 @@ def test_meanReversion_window_search():
     )
 
 
+@pytest.mark.realdata
 def test_pairFinding_on_real_data():
     # Clusters PAIR_TICKERS with PairFinding (correlation distance -> PCA ->
     # DBSCAN) over 2013-2025, then findPairs tests every pair inside a cluster
@@ -245,6 +255,7 @@ def test_zScorePositions_carries_state_only_within_a_run():
     assert rules.update(dates[:2], hold, mu, std, p).loc["A", "position"] == 0
 
 
+@pytest.mark.realdata
 @pytest.mark.parametrize("numberPair", [1,2])
 def test_backtestEngine_on_real_data_pairTrading(numberPair):
     # PAIR_TICKERS, candidates paired inside the PairFinding clusters.
@@ -256,6 +267,7 @@ def test_backtestEngine_on_real_data_pairTrading(numberPair):
     )
 
 
+@pytest.mark.realdata
 @pytest.mark.parametrize("numberPair", [30, 50])
 def test_backtestEngine_on_sp500_pairTrading(numberPair):
     # Current S&P 500 members with a full 2010-2024 history (survivorship
@@ -355,6 +367,76 @@ def _backtest_pair_trading(ohlcv, strategy, title, filename, start="2020-01-01")
     return pairStrategy
 
 
+@pytest.mark.realdata
+def test_famaFrenchData_on_real_data():
+    # Daily 5 factors + momentum, in percent: complete, sorted, plausible
+    # magnitudes, and the market factor is the market (^GSPC daily returns).
+    ff = DataLoader.getFamaFrenchData(FF_START, FF_END)
+
+    assert list(ff.columns) == ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF", "Mom"]
+    assert not ff.isna().any().any()
+    assert ff.index.is_monotonic_increasing and ff.index.is_unique
+    assert ff.index[0] >= pd.Timestamp(FF_START) and ff.index[-1] <= pd.Timestamp(FF_END)
+
+    # percent per day: the market moves about 1% a day, the risk-free rate
+    # is a few hundredths of a percent and never negative
+    assert 0.5 < ff["Mkt-RF"].std() < 2.0
+    assert ((ff["RF"] >= 0) & (ff["RF"] < 0.1)).all()
+    assert (ff[FF_FACTORS].abs() < 25).all().all()
+
+    spx = DataLoader.getData(FF_START, "2026-08-02", ["^GSPC"], "1d")["Close"].pct_change() * 100
+    market = pd.concat([ff["Mkt-RF"] + ff["RF"], spx], axis=1, join="inner").dropna()
+    assert len(market) > 0.95 * len(ff)
+    assert market.corr().iloc[0, 1] > 0.95
+
+
+def test_famaFrenchRegression_recovers_synthetic_loadings(monkeypatch):
+    # Synthetic factors and a stock built from known loadings: the regression
+    # must give them back. DataLoader is replaced, so no data is downloaded.
+    rng = np.random.default_rng(0)
+    dates = pd.bdate_range("2015-01-01", periods=1500)
+    stds = {"Mkt-RF": 1.0, "SMB": 0.6, "HML": 0.7, "RMW": 0.5, "CMA": 0.4, "Mom": 0.9}
+    ff = pd.DataFrame({f: rng.normal(0, sd, len(dates)) for f, sd in stds.items()}, index=dates)
+    ff["RF"] = 0.01
+    loadings = {"const": 0.02, "Mkt-RF": 1.2, "SMB": 0.5, "HML": -0.3, "RMW": 0.2, "CMA": -0.1, "Mom": 0.4}
+
+    # famaFrenchRegression regresses 100 * log returns minus RF on the factors
+    excess = loadings["const"] + sum(loadings[f] * ff[f] for f in FF_FACTORS) + rng.normal(0, 0.3, len(dates))
+    logReturns = (excess + ff["RF"]) / 100
+    logReturns.iloc[0] = 0.0  # first return is dropped by logReturn()
+    prices = pd.DataFrame({"Adj Close": 100 * np.exp(logReturns.cumsum())}, index=dates)
+
+    monkeypatch.setattr(DataLoader, "getData", lambda *args, **kwargs: prices.copy())
+    monkeypatch.setattr(DataLoader, "getFamaFrenchData", lambda *args, **kwargs: ff)
+    model = strategies.famaFrenchRegression(["SYNTH"], "2015-01-01", "2021-01-01")
+
+    assert list(model.params.index) == ["const"] + FF_FACTORS
+    assert model.nobs == len(dates) - 1
+    for name, value in loadings.items():
+        assert abs(model.params[name] - value) < 0.03, name
+    assert model.rsquared > 0.9
+
+
+@pytest.mark.realdata
+def test_famaFrenchRegression_on_real_data():
+    # AAPL on the 5 factors + momentum, 2011-2026: a large-cap growth stock
+    # should load about 1 on the market, negatively on value (HML), and the
+    # factors should explain a good part of its daily moves.
+    model = strategies.famaFrenchRegression(["AAPL"], FF_START, FF_END)
+    ff = DataLoader.getFamaFrenchData(FF_START, FF_END)
+    print(f"\n{model.summary()}")
+
+    assert list(model.params.index) == ["const"] + FF_FACTORS
+    assert model.nobs > 0.95 * len(ff)
+    assert 0.8 < model.params["Mkt-RF"] < 1.6
+    assert model.params["HML"] < 0
+    assert model.rsquared > 0.3
+    assert abs(model.params["const"]) < 0.1  # daily alpha, in percent
+
+    _plot_fama_french(ff, model, "AAPL", "famaFrench_realData.png")
+
+
+@pytest.mark.realdata
 def test_backtestEngine_on_real_data_uniformCombiner():
     # Uniform 1/n blend of cross-sectional 12-1 momentum and OU mean reversion.
     # MeanReversion recalibrates per step, so like its own test we only backtest
@@ -395,6 +477,7 @@ def test_backtestEngine_on_real_data_uniformCombiner():
     )
 
 
+@pytest.mark.realdata
 def test_backtestEngine_on_real_data_invVolCombiner():
     strategy = _backtest_calibrated_combiner(InvVol, "inverse-vol", "backtestEngine_invVol_realData.png")
 
@@ -405,6 +488,7 @@ def test_backtestEngine_on_real_data_invVolCombiner():
     assert np.allclose(weights[traded] * vol[traded], (weights[traded] * vol[traded]).iloc[0])
 
 
+@pytest.mark.realdata
 def test_backtestEngine_on_real_data_riskParityCombiner():
     strategy = _backtest_calibrated_combiner(RiskParity, "risk parity", "backtestEngine_riskParity_realData.png")
 
@@ -630,6 +714,35 @@ def _plot_pairs(close: pd.DataFrame, returns: pd.DataFrame, clusters: pd.Series,
     assert os.path.exists(out_path)
 
 
+def _plot_fama_french(ff: pd.DataFrame, model, ticker, filename):
+    # Left: growth of $1 in each factor portfolio. Right: the ticker's
+    # loadings with their 95% confidence intervals, alpha annualized.
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    fig, (ax_fac, ax_beta) = plt.subplots(1, 2, figsize=(16, 6), gridspec_kw={"width_ratios": [1.4, 1]})
+
+    for factor in FF_FACTORS:
+        ax_fac.plot(ff.index, (1 + ff[factor] / 100).cumprod(), label=factor, linewidth=1)
+    ax_fac.set_yscale("log")
+    ax_fac.set_title("Fama-French factors: growth of $1 (log scale)")
+    ax_fac.legend(loc="upper left", fontsize=9)
+
+    betas = model.params[FF_FACTORS]
+    errors = (model.conf_int().loc[FF_FACTORS, 1] - betas).values
+    ax_beta.bar(FF_FACTORS, betas.values, yerr=errors, capsize=4,
+                color=["tab:blue" if b >= 0 else "tab:red" for b in betas])
+    ax_beta.axhline(0, color="black", linewidth=0.6)
+    alpha = model.params["const"] * 252
+    ax_beta.set_title(f"{ticker} loadings (95% CI), R² {model.rsquared:.2f}, "
+                      f"alpha {alpha:.1f}%/yr (t = {model.tvalues['const']:.1f})")
+
+    fig.tight_layout()
+    out_path = os.path.join(PLOT_DIR, filename)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+    assert os.path.exists(out_path)
+
+
 if __name__ == "__main__":
     test_backtestEngine_on_real_data()
     test_backtestEngine_on_real_data_meanReversion()
@@ -643,4 +756,6 @@ if __name__ == "__main__":
     test_backtestEngine_on_real_data_invVolCombiner()
     test_backtestEngine_on_real_data_riskParityCombiner()
     test_riskParity_accounts_for_correlation()
+    test_famaFrenchData_on_real_data()
+    test_famaFrenchRegression_on_real_data()
     print("ok")

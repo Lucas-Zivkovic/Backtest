@@ -1,6 +1,54 @@
 # Backtest
 
+[![tests](https://github.com/Lucas-Zivkovic/Backtest/actions/workflows/tests.yml/badge.svg)](https://github.com/Lucas-Zivkovic/Backtest/actions/workflows/tests.yml)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An event-driven backtesting engine for equity long/short strategies, with realistic transaction costs, square-root market impact, and a performance/metrics layer. It is used to research momentum, single-stock mean reversion, and pair trading on US large caps, including the S&P 500 grouped by sub-industry.
+
+The point is not only to get a good Sharpe ratio, but to know whether a result is real or comes from a bias, a bug, or chance. The main finding is negative and explained: once look-ahead, data and cost issues are fixed, classic pair trading on the S&P 500 shows no reliable edge since 2015 (see [Findings](#findings-so-far)).
+
+![Pair trading on the S&P 500, 30 pairs, 10% volatility target, 2015-2024](plots/backtestEngine_pairTrading_sp500_30pairs.png)
+
+## Quick start
+
+```bash
+git clone https://github.com/Lucas-Zivkovic/Backtest.git
+cd Backtest
+uv sync                                                  # install dependencies
+uv run pytest test_backtest_engine.py -m "not realdata"  # fast unit tests, no network
+uv run pytest test_backtest_engine.py -k famaFrench -s   # downloads Fama-French factors, regresses AAPL
+```
+
+A minimal backtest (12-1 momentum on 12 mega-caps, about 10 s). The engine takes any data source with an `iterate(start, end)` method:
+
+```python
+import numpy as np
+
+import DataLoader
+from BacktestEngine import BacktestEngine
+from Strategies.CrossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
+
+
+class InMemoryDataSource:
+    """Yields (date, OHLCV history up to date), one date at a time."""
+
+    def __init__(self, prices):
+        self.prices = prices
+
+    def iterate(self, start, end):
+        mask = (self.prices.index >= start) & (self.prices.index <= end)
+        for i in np.where(mask)[0]:
+            yield self.prices.index[i], self.prices.iloc[: i + 1]
+
+
+tickers = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "JPM", "XOM", "JNJ", "PG", "V", "UNH"]
+ohlcv = DataLoader.getOHLCV("2015-01-01", "2025-01-01", tickers, "1d").dropna()
+strategy = CrossSectionalMomentumStrategy(skipMonths=1, lookbackMonth=12)
+engine = BacktestEngine(strategy, InMemoryDataSource(ohlcv))
+engine.run("2017-01-01", "2025-01-01")
+print(engine.metrics)
+```
 
 ## Project layout
 
@@ -32,6 +80,7 @@ Strategies/
 
 test_backtest_engine.py  Unit tests and end-to-end research runs on real data
 plots/                   Charts written by the research runs
+docs/RESUME_PROJET.txt   Project summary in French: approach, problems found, results
 ```
 
 ## How the engine works
@@ -71,9 +120,9 @@ A `Strategy` only implements `signal(prices)`. Its result is either a per-ticker
 ## Data
 
 - **Prices:** `DataLoader.getOHLCV(start, end, tickers, "1d")` downloads from Yahoo Finance and caches one CSV per request. Open/High/Low/Close are adjusted for dividends by default (`adjusted=True`), so ex-dividend days are not price drops; Volume is left as traded.
-- **Cache location:** the cache folder defaults to `../Project1/data`. Set `QUANT_DATA_PATH` to use another one. Long ticker lists get a hashed file name.
+- **Cache location:** downloads are cached in `data/` (git-ignored, created on first use). Set `QUANT_DATA_PATH` to use another folder. Long ticker lists get a hashed file name.
 - **S&P 500:** `DataLoader.getSP500Constituents()` downloads the current members with their GICS sector and sub-industry from Wikipedia, once.
-- **Fama-French:** `DataLoader.getFamaFrenchData(start, end)` gives the daily 5 factors plus momentum.
+- **Fama-French:** `DataLoader.getFamaFrenchData(start, end)` gives the daily 5 factors plus momentum, in percent, from Kenneth French's data library. `strategies.famaFrenchRegression(ticker, start, end)` regresses one stock's excess returns on them.
 
 **Survivorship bias:** the S&P 500 list is today's members, so companies that left the index or went bankrupt are missing. The S&P 500 test also requires a full price history and more than $5M of median daily trading volume *before* the backtest starts.
 
@@ -89,16 +138,17 @@ uv sync
 
 `test_backtest_engine.py` contains two kinds of tests:
 
-- **Unit tests**, fast and without data: trade rules, state carried between steps, risk parity.
+- **Unit tests**, fast and without network: trade rules, state carried between steps, risk parity, and recovery of known Fama-French loadings on synthetic data. They run on every push (GitHub Actions).
   ```bash
-  uv run pytest test_backtest_engine.py -k "zScorePositions or riskParity_accounts" -v
+  uv run pytest test_backtest_engine.py -m "not realdata" -v
   ```
-- **Research runs** on real data. They download and cache prices on first use, write a chart to `plots/`, and check the accounting: each day's return equals positions × returns − costs, costs ≥ 0, gross exposure stays within its limit, and nothing traded uses data from after the trade date.
+- **Research runs** on real data, marked `realdata`. They download and cache prices on first use, write a chart to `plots/`, and check the accounting: each day's return equals positions × returns − costs, costs ≥ 0, gross exposure stays within its limit, and nothing traded uses data from after the trade date.
   ```bash
   uv run pytest test_backtest_engine.py -k pairFinding -s          # clusters and cointegration
   uv run pytest test_backtest_engine.py -k "real_data_pairTrading" -s
   uv run pytest test_backtest_engine.py -k sp500 -s                # ~5 min: S&P 500, 2015-2024
   uv run pytest test_backtest_engine.py -k meanReversion -s        # slow: one OU fit per ticker per day
+  uv run pytest test_backtest_engine.py -k famaFrench -s           # factor data and AAPL factor loadings
   ```
   Add `-s` to see the printed tables (formations, metrics).
 

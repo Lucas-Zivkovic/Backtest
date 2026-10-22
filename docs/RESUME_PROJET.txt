@@ -1,0 +1,183 @@
+RÉSUMÉ DU PROJET — MOTEUR DE BACKTEST ET RECHERCHE DE STRATÉGIES ACTIONS
+==========================================================================
+
+1. OBJECTIF
+-----------
+Construire un moteur de backtest événementiel pour des stratégies long/short sur
+actions américaines, puis s'en servir pour tester honnêtement plusieurs idées :
+momentum, mean reversion sur une action, et pair trading. Le but n'est pas
+seulement d'obtenir un bon Sharpe, mais de savoir si un résultat est réel ou
+s'il vient d'un biais, d'un bug ou du hasard.
+
+
+2. CE QUI A ÉTÉ CONSTRUIT
+-------------------------
+Moteur de backtest (BacktestEngine.py)
+  - Avance jour par jour. La stratégie ne voit que les prix jusqu'à la veille,
+    donc pas de look-ahead.
+  - P&L du jour = positions × rendement close-to-close − coûts.
+  - Trois coûts de transaction : frais (0,05 %), demi-spread, et impact de
+    marché en racine carrée (σ × sqrt(volume échangé / volume moyen)).
+
+Architecture des stratégies
+  - Classe de base Strategy : une stratégie implémente seulement signal().
+  - Le signal garde tout ce qui a été calculé (paramètres ajustés, z-scores,
+    p-values), donc chaque décision peut être inspectée après coup.
+  - Cache du signal pour ne pas recalculer plusieurs fois par jour.
+
+Stratégies
+  - Momentum 12-1 cross-sectionnel (long décile haut, short décile bas).
+  - Mean reversion par action : modèle d'Ornstein-Uhlenbeck (OU) ajusté par
+    maximum de vraisemblance, test ADF.
+  - Pair trading : recherche de paires, test de cointégration, trading du
+    z-score du spread.
+  - Combinaison de stratégies : Uniform, InvVol, RiskParity, avec des poids
+    calibrés sur une période qui se termine avant le backtest.
+  - Cible de volatilité : met n'importe quelle stratégie à 10 % de volatilité
+    annuelle attendue, levier plafonné à 4.
+
+Données (DataLoader.py)
+  - Téléchargement Yahoo Finance avec cache local.
+  - Prix ajustés des dividendes.
+  - Liste du S&P 500 avec les sous-industries GICS (Wikipedia).
+  - Facteurs Fama-French.
+
+Métriques : Sharpe, Sortino, drawdown maximal et durée, hit ratio, payoff
+ratio, turnover, nombre de jours investis et de jours de trading.
+
+Tests (test_backtest_engine.py)
+  - Tests unitaires rapides sur les règles de trading.
+  - Runs de recherche sur données réelles. Ils vérifient que la comptabilité
+    est exacte, que les coûts sont positifs, que le levier est respecté et
+    qu'il n'y a pas de look-ahead, puis produisent des graphiques dans plots/.
+
+
+3. DÉMARCHE ET PROBLÈMES TROUVÉS
+--------------------------------
+Mean reversion sur une action
+  - Problème : la position était décidée chaque jour sans mémoire. Une
+    position ouverte à z = 1,6 était fermée dès z = 1,4, donc on gardait des
+    petits gains et on prenait les pertes en entier.
+    Correction : la position est conservée jusqu'à |z| < 0,5, avec un stop à
+    |z| > 3.
+  - Problème : le test ADF fermait les positions au pire moment.
+    Correction : il ne sert plus qu'à décider des entrées.
+  - Problème : la moyenne mobile se rapprochait du prix et simulait un retour
+    à la moyenne qui n'avait pas eu lieu.
+    Correction : moyenne et écart-type figés à l'entrée.
+  - Autres corrections :
+      - prix en log
+      - filtre sur la demi-vie de l'OU
+      - seuil ADF plus strict (0,01)
+      - pondération par l'inverse de la volatilité
+      - un ajustement OU qui ne converge pas est rejeté au lieu d'être utilisé
+
+Données
+  - Les dividendes faisaient apparaître de fausses baisses de prix (ex. XOM :
+    +19 % en prix seul contre +72 % dividendes compris sur 2015-2023).
+    Correction : prix ajustés.
+  - Le S&P 500 compte 503 tickers, et le nom du fichier de cache dépassait la
+    limite de 255 caractères. Correction : nom haché.
+  - Certains historiques n'étaient pas ceux de l'entreprise actuelle (SW
+    avant une fusion). Correction : filtre de liquidité calculé uniquement
+    sur des données antérieures au backtest.
+
+Pair trading
+  - Le test d'Engle-Granger dépend de l'ordre des deux actions (WFC/GS :
+    p = 0,004 ; GS/WFC : p = 0,039).
+    Correction : test de Johansen, symétrique.
+  - Avec environ 35 paires testées, une ou deux passent à 5 % par hasard.
+    Correction : test de stabilité. Une paire doit être cointégrée sur toute
+    la période de formation ET sur chacune de ses deux moitiés.
+  - Moyenne et écart-type du spread recalculés sur 120 jours : trop court pour
+    un spread dont la demi-vie est de plusieurs mois.
+    Correction : estimation une fois sur la période de formation.
+  - Les paires choisies une fois en 2019 ne tenaient plus en 2020-2024.
+    Correction : re-sélection tous les 2 ans, sur les 5 années précédentes.
+  - L'univers était trop petit. Correction : S&P 500 groupé par
+    sous-industrie, soit environ 1 470 paires candidates au lieu de 35.
+
+Bug majeur dans le moteur
+  - L'impact de marché était compté comme si tout le portefeuille était
+    échangé, au lieu d'être pondéré par la part réellement échangée.
+  - Sur un backtest de pair trading, les coûts atteignaient 13,8 % alors que
+    le gain avant coûts était de +0,8 %.
+  - Corrigé. Tous les backtests précédents surestimaient donc les coûts.
+
+Métriques
+  - Le Sharpe valait −inf (ou −9e16 à cause d'arrondis) quand la stratégie ne
+    tradait pas. Il vaut maintenant NaN.
+  - Ajout du nombre de jours investis et de jours de trading : un Sharpe
+    calculé sur 15 jours ne doit pas avoir l'air aussi solide qu'un Sharpe
+    calculé sur 1 000 jours.
+
+
+4. RÉSULTATS
+------------
+Mean reversion sur une action (12 grandes capitalisations, 2015-2022)
+  - Sharpe −1,09, −5,9 % au total (run fait avant la correction des coûts).
+  - Pas d'avantage. Acheter les baisses de grandes capitalisations en tendance
+    revient à parier contre le momentum.
+
+Pair trading, 35 grandes capitalisations
+  - Aucune paire stable à aucune date de formation.
+  - Les « meilleures » paires étaient du hasard.
+
+Pair trading, S&P 500, 2020-2024, sans cible de volatilité
+  - 10 paires : +2,6 %, Sharpe 0,13
+  - 20 paires : +3,8 %, Sharpe 0,33
+  - Pas significatif statistiquement.
+
+Pair trading, S&P 500 (407 actions), 2015-2024, cible de volatilité 10 %
+  - 30 paires : −13,6 %, Sharpe −0,15, drawdown max −34,6 %
+  - 50 paires : −14,1 %, Sharpe −0,16
+  - Raisons :
+      - très peu de paires stables avant 2019 (2 à 6), donc un portefeuille
+        concentré
+      - la cible de volatilité redimensionne le portefeuille chaque jour,
+        soit environ 9 fois le portefeuille échangé par an
+      - le résultat dépend fortement des dates de re-sélection
+
+Conclusion : une fois les problèmes de code, de données et de coûts corrigés,
+le pair trading classique sur le S&P 500 ne montre pas d'avantage fiable
+depuis 2015 net de coûts. C'est cohérent avec la littérature (Gatev et al.),
+qui montre le déclin de cette stratégie depuis les années 2000.
+
+
+5. CE QUE J'AI APPRIS
+---------------------
+  - Un Sharpe négatif se diagnostique avant de modifier des paramètres : il
+    faut séparer le signal, les coûts et la logique de trading.
+  - Comparer le rendement avant et après coûts révèle vite d'où vient une
+    perte, et a permis de trouver le bug d'impact.
+  - Tester beaucoup de paires produit des faux positifs. Il faut des tests
+    de stabilité et des données hors échantillon.
+  - Chaque étape (sélection, calibration, filtre) ne doit utiliser que des
+    données passées.
+  - Un résultat qui change selon les dates de re-sélection n'est pas robuste.
+  - Un résultat négatif bien expliqué est un vrai résultat de recherche.
+
+
+6. LIMITES ET PISTES
+--------------------
+Limites
+  - Exécution au même close que le signal. L'ouverture du lendemain serait
+    plus prudente.
+  - Biais de survivant : la liste du S&P 500 est celle d'aujourd'hui.
+  - Pas de coût de financement ni d'emprunt de titres. Le cash ne rapporte
+    pas d'intérêts.
+  - Pas de test de significativité (t-stat, bootstrap, Sharpe déflaté) ni de
+    période de test jamais regardée.
+  - Le moteur ralentit sur les longs historiques : il recalcule tout
+    l'historique à chaque pas.
+
+Pistes
+  - Relancer le momentum et les combinaisons de stratégies depuis la
+    correction des coûts.
+  - Mean reversion sur les résidus d'une régression Fama-French plutôt que
+    sur les prix (approche Avellaneda-Lee).
+  - Pair trading :
+      - ne trader que si au moins 10 paires sont stables
+      - ne redimensionner le portefeuille que si l'échelle change de plus de
+        20 %
+      - valider sur une période jamais utilisée

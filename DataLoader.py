@@ -8,13 +8,10 @@ import pandas as pd
 import pandas_datareader.data as web
 import datetime
 
-# Resolved relative to this file so the project works on any machine; set
-# QUANT_DATA_PATH to point the cache somewhere else.
+# Download cache: data/ next to this file (git-ignored); set QUANT_DATA_PATH
+# to point it somewhere else.
 data_path = os.path.join(
-    os.environ.get(
-        "QUANT_DATA_PATH",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Project1", "data"),
-    ),
+    os.environ.get("QUANT_DATA_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")),
     "",
 )
 
