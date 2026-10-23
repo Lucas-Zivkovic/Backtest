@@ -17,6 +17,8 @@ dependencies = [
     "requests>=2.31",
     "lxml>=4.9",
     "hmmlearn>=0.3.0",
+    "python-kraken-sdk>=1.6.2",
+    "ib-async>=1.0 ; python_full_version >= '3.10'",
 ]
 
 [dependency-groups]

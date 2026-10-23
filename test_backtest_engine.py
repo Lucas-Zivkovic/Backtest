@@ -1,6 +1,9 @@
 import os
 
 import matplotlib
+
+from DataLoaders.IBKRLoader import IBKRLoader
+
 matplotlib.use("Agg")  # headless backend so the test runs without a display
 import matplotlib.pyplot as plt
 import numpy as np
@@ -76,6 +79,30 @@ def test_backtestEngine_on_real_data():
         "backtestEngine_realData.png",
     )
 
+
+@pytest.mark.realdata
+def test_backtestEngine_on_real_data():
+    ibkr = IBKRLoader()
+    ohlcv = ibkr.getOHLCV("2015-01-01", "2023-01-01", REAL_TICKERS, "30m").dropna()
+    close = ohlcv.xs("Close", axis=1, level=1)
+    dates = ohlcv.index
+    warmup = 280  # skip (1mo) + lookback (12mo) = 273 trading days needed before the 12-1 signal is populated
+
+    strategy = CrossSectionalMomentumStrategy(skipMonths=1, lookbackMonth=12)
+    engine = BacktestEngine(strategy, InMemoryDataSource(ohlcv), transactionCostRate=0.0005)
+    results = engine.run(dates[warmup], dates[-1])
+
+    n_steps = len(close) - warmup
+    step_dates = dates[warmup:]
+    assert len(results) == n_steps
+    assert len(engine.costs) == n_steps
+    assert all(c >= 0 for c in engine.costs)
+
+    _plot_backtest(
+        step_dates, results, engine.costs,engine.metrics,
+        f"BacktestEngine — cross-sectional 12-1 momentum on {len(REAL_TICKERS)} large-caps",
+        "backtestEngine_realData.png",
+    )
 
 @pytest.mark.realdata
 def test_backtestEngine_on_real_data_meanReversion():
@@ -303,6 +330,43 @@ def test_backtestEngine_on_sp500_pairTrading(numberPair):
     for pairs in pairTrading.formations.values():
         assert (groups[pairs["a"]].values == groups[pairs["b"]].values).all()
 
+
+@pytest.mark.realdata
+@pytest.mark.parametrize("numberPair", [30, 50])
+def test_backtestEngine_on_sp500_pairTrading_IBKR(numberPair):
+    # Current S&P 500 members with a full 2010-2024 history (survivorship
+    # bias: companies dropped from the index are missing), candidates paired
+    # inside each GICS sub-industry: ~1400 candidate pairs instead of ~35.
+    # Traded on 2015-2024, 5 formations; the first uses 2010-2014.
+    # Stocks trading under $5M a day before 2015 are left out: their early
+    # history is not the S&P 500 company (e.g. a pre-merger listing), and the
+    # square-root impact makes them very expensive. Only pre-2015 data is
+    # used for this, so it does not look ahead into the backtest.
+    # The book is scaled to 10% expected annual volatility, gross capped at 4.
+    constituents = DataLoader.getSP500Constituents()
+    ibkr = IBKRLoader()
+    ohlcv = ibkr.getOHLCV("2010-01-01", "2025-01-01", list(constituents["Symbol"]), "30m")
+    close = ohlcv.xs("Close", axis=1, level=1)
+    volume = ohlcv.xs("Volume", axis=1, level=1)
+    dollarVolume = (close * volume).loc[:"2014-12-31"].median()
+    universe = [t for t in close.columns if close[t].notna().all() and dollarVolume[t] > 5e6]
+    ohlcv = ohlcv[universe]
+    print(f"\nuniverse: {len(universe)} of {len(close.columns)} tickers")
+    assert len(universe) > 350
+
+    groups = constituents.set_index("Symbol")["SubIndustry"]
+    pairTrading = PairTrading(numberPair=numberPair, formationDays=5 * 252, refitDays=2 * 252, groups=groups)
+    strategy = VolatilityTarget(pairTrading, targetVol=0.10, lookback=60, maxGross=4.0)
+    _backtest_pair_trading(
+        ohlcv, strategy,
+        f"OU pair trading on {len(universe)} S&P 500 stocks by sub-industry, "
+        f"{numberPair} pairs re-selected every 2 years, 10% vol target, 2015-2024",
+        f"backtestEngine_pairTrading_sp500_{numberPair}pairs.png",
+        start="2015-01-01",
+    )
+    # every pair is two stocks of the same sub-industry
+    for pairs in pairTrading.formations.values():
+        assert (groups[pairs["a"]].values == groups[pairs["b"]].values).all()
 
 def _backtest_pair_trading(ohlcv, strategy, title, filename, start="2020-01-01"):
     # Traded from `start` to the end of the data. Pairs, hedge ratios and the

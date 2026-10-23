@@ -1,12 +1,25 @@
+"""Data loaders with a local CSV cache.
+
+Prices come from the classes in DataLoaders/, which all return the same
+OHLCV format:
+    YahooFinanceLoader   stocks, ETFs, indices (no account needed)
+    KrakenLoader         crypto pairs (no account needed)
+    IBKRLoader           Interactive Brokers (TWS or IB Gateway running)
+
+This module keeps the shortcuts used across the project: getOHLCV (Yahoo),
+the raw yfinance download getData, S&P 500 constituents (Wikipedia) and
+Fama-French factors.
+"""
 import hashlib
 import io
 import os
 
-import requests
-import yfinance as yf
 import pandas as pd
 import pandas_datareader.data as web
-import datetime
+import requests
+import yfinance as yf
+
+from DataLoaders.YahooFinanceLoader import YahooFinanceLoader
 
 # Download cache: data/ next to this file (git-ignored); set QUANT_DATA_PATH
 # to point it somewhere else.
@@ -15,7 +28,15 @@ data_path = os.path.join(
     "",
 )
 
+
+def getOHLCV(startDate:str, endDate:str, symbols:list, interval:str, adjusted:bool=True)->pd.DataFrame:
+    """Open/High/Low/Close/Volume from Yahoo Finance, see YahooFinanceLoader.
+    For Kraken or Interactive Brokers, use KrakenLoader / IBKRLoader."""
+    return YahooFinanceLoader(adjusted=adjusted, cachePath=data_path).getOHLCV(startDate, endDate, symbols, interval)
+
+
 def getData(startDate:str, endDate:str, symbols:list, interval:str):
+    """Raw yfinance download (with Adj Close), cached as CSV."""
     path = getPath(startDate, endDate, symbols, interval)
     if os.path.exists(path):
         return _readCachedCsv(path, symbols)
@@ -49,28 +70,6 @@ def getData(startDate:str, endDate:str, symbols:list, interval:str):
 
     return data
 
-def getOHLCV(startDate:str, endDate:str, symbols:list, interval:str, adjusted:bool=True)->pd.DataFrame:
-    """Open/High/Low/Close/Volume data.
-
-    For a single symbol: a flat DataFrame with those 5 columns.
-    For multiple symbols: columns are (ticker, field), so data[ticker] gives
-    that ticker's OHLCV DataFrame.
-
-    With `adjusted`, Open/High/Low/Close are scaled by Adj Close / Close, so
-    they include dividends: an ex-dividend date is not a price drop, and
-    Close returns are total returns. Volume is left as traded.
-    """
-    data = getData(startDate, endDate, symbols, interval)
-    fields = ["Open", "High", "Low", "Close", "Volume"]
-    ohlcv = data[fields].copy()
-    if adjusted:
-        factor = data["Adj Close"] / data["Close"]
-        for field in ["Open", "High", "Low", "Close"]:
-            ohlcv.loc[:, field] = (data[field] * factor).values
-    if len(symbols) == 1:
-        return ohlcv
-    return ohlcv.swaplevel(axis=1).sort_index(axis=1)
-
 def _readCachedCsv(path:str, symbols:list):
     data = pd.read_csv(path, header=[0, 1], index_col=0, parse_dates=True)
     if len(symbols) == 1:
@@ -85,6 +84,10 @@ def getPath(startDate:str, endDate:str, symbols:list, interval:str)->str:
         digest = hashlib.sha1(datastr.encode()).hexdigest()[:12]
         datastr = f"{len(symbols)}tickers_{digest}"
     return f"{data_path}{datastr}_{startDate}_{endDate}_{interval}.csv".replace(' ', '')
+
+# --------------------------------------------------------------------------
+# Other data
+# --------------------------------------------------------------------------
 
 def getSP500Constituents()->pd.DataFrame:
     """Current S&P 500 members from Wikipedia: columns Symbol (in Yahoo
@@ -114,17 +117,6 @@ def getSP500Constituents()->pd.DataFrame:
     })
     constituents.to_csv(path, index=False)
     return constituents
-
-def removeAll():
-    removeList = os.listdir(data_path)
-    for path in removeList: 
-        removePath = data_path+path
-        os.remove(removePath)
-
-def removePath(path:str):
-    path = data_path + path
-    if os.path.exists(path):
-        os.removePath(path)
 
 def getFamaFrenchData(startDate:str, endDate:str):
     """Daily Fama-French 5 factors (Mkt-RF, SMB, HML, RMW, CMA, RF) plus momentum (Mom), in percent."""
@@ -163,3 +155,17 @@ def fromDataReturnsSplit_Divident(data):
     splits = data.splits
     dividends = data.dividends
     return (splits,dividends)
+
+
+# --------------------------------------------------------------------------
+# Cache
+# --------------------------------------------------------------------------
+
+def removeAll():
+    for path in os.listdir(data_path):
+        os.remove(data_path + path)
+
+def removePath(path:str):
+    path = data_path + path
+    if os.path.exists(path):
+        os.remove(path)
