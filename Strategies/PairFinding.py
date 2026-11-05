@@ -34,8 +34,11 @@ def johansen(logA: Series, logB: Series, significance: float = 0.05) -> tuple[fl
     spread = log a - beta * log b. Unlike Engle-Granger, swapping a and b
     gives the same statistic (and beta becomes 1 / beta, the same spread)."""
     result = coint_johansen(np.column_stack([logA, logB]), det_order=0, k_ar_diff=1)
-    vector = result.evec[:, 0]
-    return result.lr1[0] / result.cvt[0, JOHANSEN_COLUMN[significance]], -vector[1] / vector[0]
+    # the eigenvalues are real in theory, but statsmodels' eigen solver can
+    # return them as complex numbers with a zero imaginary part
+    vector = np.real(result.evec[:, 0])
+    strength = float(np.real(result.lr1[0])) / result.cvt[0, JOHANSEN_COLUMN[significance]]
+    return strength, float(-vector[1] / vector[0])
 
 
 def findPairs(prices: DataFrame, significance: float = 0.05, groups: Series = None) -> DataFrame:

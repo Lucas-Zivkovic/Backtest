@@ -16,7 +16,7 @@ The point is not only to get a good Sharpe ratio, but to know whether a result i
 git clone https://github.com/Lucas-Zivkovic/Backtest.git
 cd Backtest
 uv sync                                                  # install dependencies
-uv run pytest test_backtest_engine.py -m "not realdata"  # fast unit tests, no network
+uv run pytest test_backtest_engine.py test_data_loaders.py -m "not realdata"  # fast unit tests, no network
 uv run pytest test_backtest_engine.py -k famaFrench -s   # downloads Fama-French factors, regresses AAPL
 ```
 
@@ -54,7 +54,7 @@ print(engine.metrics)
 
 ```
 BacktestEngine.py        Event loop: steps through dates, asks the strategy for target weights, books P&L and costs
-DataLoader.py            Downloads and caches OHLCV data (yfinance), S&P 500 constituents (Wikipedia), Fama-French factors
+DataLoader.py            Downloads and caches OHLCV data (Yahoo Finance, Kraken, Interactive Brokers), S&P 500 constituents (Wikipedia), Fama-French factors
 Transaction.py           Cost models: percentage fee, half-spread, square-root market impact
 PositionSizing.py        Turns signals into weights (dollar-neutral, signed, inverse-vol, Kelly, risk contribution...)
 PerformanceAnalyzer.py   Turns per-step returns and positions into a metrics table
@@ -79,6 +79,7 @@ Strategies/
     RiskParity.py                    Equal risk contribution, using the full covariance matrix
 
 test_backtest_engine.py  Unit tests and end-to-end research runs on real data
+test_data_loaders.py     Yahoo / Kraken / IBKR loaders: faked APIs, plus real-data checks
 plots/                   Charts written by the research runs
 docs/RESUME_PROJET.txt   Project summary in French: approach, problems found, results
 ```
@@ -136,11 +137,11 @@ uv sync
 
 ## Tests
 
-`test_backtest_engine.py` contains two kinds of tests:
+`test_backtest_engine.py` and `test_data_loaders.py` contain two kinds of tests:
 
-- **Unit tests**, fast and without network: trade rules, state carried between steps, risk parity, and recovery of known Fama-French loadings on synthetic data. They run on every push (GitHub Actions).
+- **Unit tests**, fast and without network: trade rules, state carried between steps, risk parity, recovery of known Fama-French loadings on synthetic data, and each data loader against a faked API (parsing, adjustment, date filtering, caching). They run on every push (GitHub Actions).
   ```bash
-  uv run pytest test_backtest_engine.py -m "not realdata" -v
+  uv run pytest test_backtest_engine.py test_data_loaders.py -m "not realdata" -v
   ```
 - **Research runs** on real data, marked `realdata`. They download and cache prices on first use, write a chart to `plots/`, and check the accounting: each day's return equals positions × returns − costs, costs ≥ 0, gross exposure stays within its limit, and nothing traded uses data from after the trade date.
   ```bash
@@ -149,6 +150,7 @@ uv sync
   uv run pytest test_backtest_engine.py -k sp500 -s                # ~5 min: S&P 500, 2015-2024
   uv run pytest test_backtest_engine.py -k meanReversion -s        # slow: one OU fit per ticker per day
   uv run pytest test_backtest_engine.py -k famaFrench -s           # factor data and AAPL factor loadings
+  uv run pytest test_data_loaders.py -m realdata -v                # real prices from each loader (IBKR needs TWS)
   ```
   Add `-s` to see the printed tables (formations, metrics).
 
