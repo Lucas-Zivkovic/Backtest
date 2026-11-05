@@ -48,7 +48,9 @@ class DataLoader(ABC):
         for symbol in symbols:
             path = self.cacheFile(self.symbolName(symbol), startDate, endDate, interval)
             if os.path.exists(path):
-                frames[self.symbolName(symbol)] = pd.read_csv(path, index_col=0, parse_dates=True)
+                data = pd.read_csv(path, index_col=0, parse_dates=True)
+                data.index = pd.DatetimeIndex(data.index)  # stays dates when the file has no bars
+                frames[self.symbolName(symbol)] = data
             else:
                 missing.append(symbol)
 
@@ -58,12 +60,20 @@ class DataLoader(ABC):
                 name = self.symbolName(symbol)
                 if name not in downloaded:
                     raise ValueError(f"{type(self).__name__} returned no data for {name}")
-                data = downloaded[name][FIELDS]
-                data.index.name = "Date"
-                self._writeCsv(data, self.cacheFile(name, startDate, endDate, interval))
-                frames[name] = data
+                frames[name] = self.cache(name, downloaded[name], startDate, endDate, interval)
 
         return self._combine([self.symbolName(s) for s in symbols], frames)
+
+    def cache(self, name: str, data: DataFrame, startDate: str, endDate: str, interval: str) -> DataFrame:
+        """Writes one symbol's bars to its cache file, unless already there.
+        A slow `download` can call it after each symbol, so an interrupted
+        download keeps the symbols it has finished."""
+        data = data[FIELDS]
+        data.index.name = "Date"
+        path = self.cacheFile(name, startDate, endDate, interval)
+        if not os.path.exists(path):
+            self._writeCsv(data, path)
+        return data
 
     def symbolName(self, symbol) -> str:
         """Column name of a symbol in the result (and in its cache file)."""

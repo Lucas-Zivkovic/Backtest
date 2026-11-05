@@ -5,6 +5,7 @@ parsing, filtering, adjustment and caching without the network. The
 `realdata` tests download real prices and check they look like market data.
 """
 import datetime as dt
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ import DataLoaders.KrakenLoader as KrakenLoader_module
 import DataLoaders.YahooFinanceLoader as YahooFinanceLoader_module
 from DataLoaders.DataLoader import FIELDS
 from DataLoaders.IBKRLoader import IBKRLoader
+from DataLoaders.KrakenHistoryLoader import KrakenHistoryLoader
 from DataLoaders.KrakenLoader import KrakenLoader
 from DataLoaders.YahooFinanceLoader import YahooFinanceLoader
 
@@ -36,7 +38,7 @@ def assertValidOHLCV(data: pd.DataFrame):
 # Base class
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("loader", [YahooFinanceLoader, KrakenLoader, IBKRLoader])
+@pytest.mark.parametrize("loader", [YahooFinanceLoader, KrakenLoader, KrakenHistoryLoader, IBKRLoader])
 def test_loader_rejects_unknown_interval(loader, tmp_path):
     with pytest.raises(ValueError, match="interval"):
         loader(cachePath=str(tmp_path)).getOHLCV("2024-01-01", "2024-02-01", ["X"], "7m")
@@ -52,8 +54,9 @@ def test_cacheKey_separates_price_settings(tmp_path):
         IBKRLoader(whatToShow="MIDPOINT", cachePath=path).cacheFile("AAPL", "a", "b", "1d"),
         IBKRLoader(useRTH=False, cachePath=path).cacheFile("AAPL", "a", "b", "1d"),
         KrakenLoader(cachePath=path).cacheFile("AAPL", "a", "b", "1d"),
+        KrakenHistoryLoader(cachePath=path).cacheFile("AAPL", "a", "b", "1d"),
     }
-    assert len(files) == 6
+    assert len(files) == 7
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +225,52 @@ def test_krakenLoader_apiError_raises(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Kraken history archive (a small local ZIP / folder)
+# --------------------------------------------------------------------------
+
+def writeKrakenArchive(folder, name="XBTUSD_60.csv"):
+    """Hourly XBTUSD candles in Kraken's archive format (no header, unix
+    seconds), 2024-01-01 00:00 to 05:00, with no trade at 02:00 and 03:00."""
+    hours = [0, 1, 4, 5]
+    rows = [f"{1704067200 + 3600 * h},{100 + h},{102 + h},{99 + h},{101 + h},{1.5 + h},{3 + h}" for h in hours]
+    path = folder / name
+    path.write_text("\n".join(rows) + "\n")
+    return path
+
+
+def test_krakenHistoryLoader_readsZip_andFillsBarsWithoutTrades(tmp_path):
+    csv = writeKrakenArchive(tmp_path)
+    archive = tmp_path / "Kraken_OHLCVT.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.write(csv, csv.name)
+
+    loader = KrakenHistoryLoader(archive=str(archive), cachePath=str(tmp_path / "cache"))
+    data = loader.getOHLCV("2024-01-01", "2024-01-02", ["XBTUSD"], "1h")
+
+    assertValidOHLCV(data)
+    assert list(data.index) == list(pd.date_range("2024-01-01 00:00", "2024-01-01 05:00", freq="h"))
+    # 02:00 and 03:00 had no trade: flat at the 01:00 close, no volume
+    assert data.loc["2024-01-01 02:00"].tolist() == [102.0, 102.0, 102.0, 102.0, 0.0]
+    assert data.loc["2024-01-01 03:00", "Close"] == 102.0
+    assert data.loc["2024-01-01 04:00"].tolist() == [104.0, 106.0, 103.0, 105.0, 5.5]
+
+    # a pair or interval that is not in the archive
+    with pytest.raises(ValueError, match="ETHUSD_60.csv"):
+        loader.getOHLCV("2024-01-01", "2024-01-02", ["ETHUSD"], "1h")
+    with pytest.raises(ValueError, match="XBTUSD_1440.csv"):
+        loader.getOHLCV("2024-01-01", "2024-01-02", ["XBTUSD"], "1d")
+
+
+def test_krakenHistoryLoader_readsFolder_andFiltersDates(tmp_path):
+    writeKrakenArchive(tmp_path)
+    loader = KrakenHistoryLoader(archive=str(tmp_path), cachePath=str(tmp_path / "cache"))
+    data = loader.getOHLCV("2024-01-01 01:00", "2024-01-01 04:00", ["XBTUSD"], "1h")
+    assert list(data.index) == list(pd.date_range("2024-01-01 01:00", "2024-01-01 03:00", freq="h"))
+    with pytest.raises(ValueError, match="No Kraken history"):
+        loader.getOHLCV("2025-01-01", "2025-02-01", ["XBTUSD"], "1h")
+
+
+# --------------------------------------------------------------------------
 # Interactive Brokers (IB client replaced)
 # --------------------------------------------------------------------------
 
@@ -307,6 +356,79 @@ def test_ibkrLoader_noBars_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(loader, "connect", lambda: FakeIB())
     with pytest.raises(ValueError, match="No IBKR data"):
         loader.getOHLCV("2024-01-01", "2024-02-01", ["AAPL"], "1d")
+
+
+def test_ibkrLoader_keepsFinishedSymbols_whenDownloadStops(monkeypatch, tmp_path):
+    # Each symbol is cached as soon as it is downloaded: when a later one
+    # fails, the next run only asks IB for what is still missing. Yahoo-style
+    # share classes (BRK-B) are asked for as IB names them (BRK B).
+    pytest.importorskip("ib_async")
+    from ib_async import BarData
+
+    asked = []
+
+    class FakeIB:
+        def __init__(self, failOn=None):
+            self.failOn = failOn
+
+        def qualifyContracts(self, contract):
+            asked.append(contract.symbol)
+            if contract.symbol == self.failOn:
+                raise ConnectionError("connection lost")
+            return [contract]
+
+        def reqHistoricalData(self, *args, **kwargs):
+            return [BarData(date=dt.date(2024, 1, d), open=10, high=12, low=9, close=11, volume=500)
+                    for d in (2, 3, 4)]
+
+        def disconnect(self):
+            pass
+
+    loader = IBKRLoader(cachePath=str(tmp_path))
+    symbols = ["AAPL", "BRK-B", "MSFT"]
+    monkeypatch.setattr(loader, "connect", lambda: FakeIB(failOn="MSFT"))
+    with pytest.raises(ConnectionError):
+        loader.getOHLCV("2024-01-01", "2024-01-05", symbols, "1d")
+    assert asked == ["AAPL", "BRK B", "MSFT"]
+
+    asked.clear()
+    monkeypatch.setattr(loader, "connect", lambda: FakeIB())
+    data = loader.getOHLCV("2024-01-01", "2024-01-05", symbols, "1d")
+    assert asked == ["MSFT"]
+    assert list(data.columns.get_level_values(0).unique()) == symbols
+    assert len(data) == 3
+
+
+def test_ibkrLoader_symbolWithoutData_getsNaN(monkeypatch, tmp_path):
+    # A symbol with no bars in the period (e.g. listed after it) is NaN
+    # among the others, with a warning, and cached so IB is not asked again.
+    pytest.importorskip("ib_async")
+    from ib_async import BarData
+
+    class FakeIB:
+        def qualifyContracts(self, contract):
+            return [contract]
+
+        def reqHistoricalData(self, contract, *args, **kwargs):
+            if contract.symbol == "NEW":
+                return []
+            return [BarData(date=dt.date(2024, 1, d), open=10, high=12, low=9, close=11, volume=500)
+                    for d in (2, 3, 4)]
+
+        def disconnect(self):
+            pass
+
+    loader = IBKRLoader(cachePath=str(tmp_path))
+    monkeypatch.setattr(loader, "connect", lambda: FakeIB())
+    with pytest.warns(UserWarning, match="No IBKR data for NEW"):
+        data = loader.getOHLCV("2024-01-01", "2024-01-05", ["AAPL", "NEW"], "1d")
+    assert data["NEW"].isna().all().all()
+    assertValidOHLCV(data["AAPL"])
+
+    monkeypatch.setattr(loader, "connect", lambda: pytest.fail("cache not used"))
+    cached = loader.getOHLCV("2024-01-01", "2024-01-05", ["AAPL", "NEW"], "1d")
+    assert isinstance(cached.index, pd.DatetimeIndex)
+    assert cached["NEW"].isna().all().all() and len(cached) == 3
 
 
 def test_ibkrLoader_walksBackInChunks(monkeypatch, tmp_path):
@@ -408,6 +530,23 @@ def test_krakenLoader_matches_yahoo_bitcoin(tmp_path):
     assert len(both) >= 50
     gap = (both["kraken"] / both["yahoo"] - 1).abs()
     assert gap.median() < 0.01
+
+
+@pytest.mark.realdata
+def test_krakenHistoryLoader_on_real_data_matches_api(tmp_path):
+    # The archive on Kraken's servers (read remotely, a few MB per pair)
+    # goes back years, and agrees with the API on the days both cover.
+    history = KrakenHistoryLoader(cachePath=str(tmp_path)).getOHLCV("2018-01-01", "2026-10-01", ["XBTUSD"], "1d")
+    assertValidOHLCV(history)
+    assert history.index[0] == pd.Timestamp("2018-01-01")
+    assert history.index.to_series().diff().dropna().eq(pd.Timedelta(days=1)).all()
+
+    today = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
+    start = (today - pd.Timedelta(days=700)).strftime("%Y-%m-%d")
+    api = KrakenLoader(cachePath=str(tmp_path)).getOHLCV(start, today.strftime("%Y-%m-%d"), ["XBTUSD"], "1d")
+    both = pd.concat({"history": history["Close"], "api": api["Close"]}, axis=1).dropna()
+    assert len(both) > 300
+    assert ((both["history"] / both["api"] - 1).abs() < 1e-6).mean() > 0.99
 
 
 @pytest.mark.realdata

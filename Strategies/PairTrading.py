@@ -54,7 +54,9 @@ class PairTrading(Strategy):
         """Select the pairs and fit their hedge ratio and OU process on
         `prices`, replacing the current pairs."""
         candidates = findPairs(prices, self.significance, self.groups)
-        self.pairs = candidates[candidates["stable"]].head(self.numberPair).reset_index(drop=True)
+        # astype(bool): with no candidate at all, "stable" is an empty object
+        # column, and indexing with it would select columns instead of rows
+        self.pairs = candidates[candidates["stable"].astype(bool)].head(self.numberPair).reset_index(drop=True)
         self.params = [findParameters(prices, pair) for pair in self.pairs.to_dict("records")]
         spreads = self.spreads(prices)
         fits = []
@@ -118,6 +120,12 @@ class PairTrading(Strategy):
         signal.index = [date]
         signal.columns.names = ["ticker", "field"]
         return signal
+
+    def score(self, prices: DataFrame) -> DataFrame:
+        """Per ticker, unlike `signal` (per pair): the position held, 0 for a
+        ticker in no current pair, so it lines up with other strategies'
+        scores in a PortfolioCombiner, even when no pair is selected."""
+        return self.positions(prices)
 
     def positions(self, prices: DataFrame) -> DataFrame:
         """Each pair gets 1/numberPair of gross, split between its legs as

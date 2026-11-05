@@ -5,8 +5,9 @@ import time
 import warnings
 
 import pandas as pd
+from pandas import DataFrame, DatetimeIndex
 
-from DataLoaders.DataLoader import DataLoader
+from DataLoaders.DataLoader import FIELDS, DataLoader
 
 
 class IBKRLoader(DataLoader):
@@ -19,8 +20,9 @@ class IBKRLoader(DataLoader):
     live, 4002 Gateway paper) and IBKR_CLIENT_ID (17).
 
     Symbols are tickers built with secType/exchange/currency ("STK" or
-    "ETF" stock, "CASH" forex pair like "EURUSD", "IND" index, "CRYPTO"),
-    or ib_async Contract objects for anything else (futures, options...).
+    "ETF" stock, Yahoo-style share classes like "BRK-B" accepted, "CASH"
+    forex pair like "EURUSD", "IND" index, "CRYPTO"), or ib_async Contract
+    objects for anything else (futures, options...).
 
     `adjusted` uses IB's ADJUSTED_LAST prices (dividends and splits) for
     daily-or-longer stock bars; other bars are raw trades. `whatToShow`
@@ -34,11 +36,14 @@ class IBKRLoader(DataLoader):
     # how much history one request returns, so long intraday periods are split.
     INTERVALS = {
         "1m": ("1 min", "1 D"), "2m": ("2 mins", "1 D"), "5m": ("5 mins", "1 W"),
-        "15m": ("15 mins", "1 W"), "30m": ("30 mins", "1 M"), "1h": ("1 hour", "1 M"),
-        "60m": ("1 hour", "1 M"), "4h": ("4 hours", "1 M"),
+        "15m": ("15 mins", "1 W"), "30m": ("30 mins", "1 M"),
+        # IB documents 1 month for 1h and 4h bars but serves a year in one
+        # request, several times faster than 12 monthly ones
+        "1h": ("1 hour", "1 Y"), "60m": ("1 hour", "1 Y"), "4h": ("4 hours", "1 Y"),
         "1d": ("1 day", None), "1wk": ("1 week", None), "1mo": ("1 month", None),
     }
-    DURATION_UNITS = {"D": pd.Timedelta(days=1), "W": pd.Timedelta(weeks=1), "M": pd.Timedelta(days=30)}
+    DURATION_UNITS = {"D": pd.Timedelta(days=1), "W": pd.Timedelta(weeks=1), "M": pd.Timedelta(days=30),
+                      "Y": pd.Timedelta(days=365)}
     PACING_SLEEP = 0.5  # seconds between requests: IB allows 60 requests / 10 min
 
     def __init__(self, secType: str = "STK", exchange: str = "SMART", currency: str = "USD",
@@ -67,11 +72,26 @@ class IBKRLoader(DataLoader):
     def download(self, symbols: list, startDate: str, endDate: str, interval: str) -> dict:
         ib = self.connect()
         try:
-            frames = {}
+            frames, empty = {}, []
             for symbol in symbols:
-                contract = self.contract(ib, symbol)
-                show = self.whatToShow or self._defaultWhatToShow(contract.secType, interval)
-                frames[self.symbolName(symbol)] = self._downloadContract(ib, contract, startDate, endDate, interval, show)
+                name = self.symbolName(symbol)
+                try:
+                    contract = self.contract(ib, symbol)
+                    show = self.whatToShow or self._defaultWhatToShow(contract.secType, interval)
+                    data = self._downloadContract(ib, contract, startDate, endDate, interval, show)
+                except ValueError as exc:
+                    # unknown at IB, or no bars in the period (e.g. listed
+                    # after it): NaN in the result, like YahooFinanceLoader
+                    warnings.warn(f"{exc}: left as NaN", stacklevel=4)
+                    empty.append(name)
+                    continue
+                # saved now: a long download that stops keeps what it has
+                frames[name] = self.cache(name, data, startDate, endDate, interval)
+            if not frames:
+                raise ValueError(f"No IBKR data for {empty} between {startDate} and {endDate}")
+            for name in empty:
+                frames[name] = self.cache(name, DataFrame(columns=FIELDS, dtype=float, index=DatetimeIndex([])),
+                                          startDate, endDate, interval)
             return frames
         finally:
             ib.disconnect()
@@ -96,7 +116,8 @@ class IBKRLoader(DataLoader):
         if isinstance(symbol, Contract):
             contract = symbol
         elif self.secType in ("STK", "ETF"):
-            contract = Stock(symbol, self.exchange, self.currency)
+            # share classes: Yahoo's BRK-B is BRK B at IB
+            contract = Stock(symbol.replace("-", " "), self.exchange, self.currency)
         elif self.secType == "CASH":
             contract = Forex(symbol)
         elif self.secType == "IND":
@@ -150,7 +171,10 @@ class IBKRLoader(DataLoader):
             step = self.DURATION_UNITS[chunk[-1]] * int(chunk.split()[0])
             cursor = end
             while cursor > start:
-                df = request(cursor.tz_localize("UTC").to_pydatetime(), chunk)
+                # the last request only asks for what is left before startDate
+                left = (cursor - start).days + 1
+                duration = chunk if left >= step.days else f"{left} D"
+                df = request(cursor.tz_localize("UTC").to_pydatetime(), duration)
                 if df is None:
                     cursor -= step  # holiday or weekend: no bars in this chunk
                     continue

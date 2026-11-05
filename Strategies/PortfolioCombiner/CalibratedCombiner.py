@@ -7,7 +7,6 @@ from pandas import DataFrame, Series
 from Strategies.PortfolioCombiner.PortfolioCombiner import PortfolioCombiner
 from Strategies.Strategy import Strategy
 from BacktestEngine import BacktestEngine
-from PerformanceAnalyzer import PerformanceAnalyzer
 
 
 class CalibratedCombiner(PortfolioCombiner):
@@ -49,7 +48,7 @@ class CalibratedCombiner(PortfolioCombiner):
             active = engine.positions.abs().sum(axis=1) > 0
             strategyMetrics["activeDays"] = float(active.mean())
             strategyMetrics["activeVolatility"] = (
-                returns[name][active].std(ddof=1) * np.sqrt(PerformanceAnalyzer().periodsPerYear)
+                returns[name][active].std(ddof=1) * np.sqrt(engine.periodsPerYear)
                 if active.sum() > 1 else 0.0
             )
             metrics[name] = strategyMetrics
